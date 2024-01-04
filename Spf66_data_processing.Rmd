@@ -1,0 +1,880 @@
+---
+title: "SPf66 data processing"
+author: "Somya Mehra"
+date: "2023-11-14"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(tidyr)
+library(readr)
+library(lubridate)
+library(ggplot2)
+library(IRanges)
+library(cowplot)
+library(ggfortify)
+library(MatchIt)
+library(survival)
+library(PMCMRplus)
+library(knitr)
+library(kableExtra)
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, message=FALSE, fig.align = "center")
+
+library(extrafont)
+font_import() # takes a few minutes
+loadfonts(device="postscript")
+
+library(showtext)
+font_add(family = "Arial", regular = "Arial.ttf") ## here is the path to the font to add.
+showtext.auto()
+```
+
+## Data input
+
+```{r data_input}
+if (!dir.exists("Spf66_data_processed")) dir.create("Spf66_data_processed")
+
+START_DATE <- as.Date("1993-10-01")
+END_DATE <- as.Date("1995-07-15")
+STUDY_DURATION <- as.numeric(difftime(END_DATE, START_DATE, unit="days"))
+
+# cleaned data from SPf66 cohort
+patient_metadata <- read_rds("Spf66_data_cleaned/patient_metadata.rds")
+camp_absences <- read_rds("Spf66_data_cleaned/camp_absences.rds")
+malaria_consultations <- read_rds("Spf66_data_cleaned/malaria_consultations.rds")
+prophylactic_periods <- read.delim("Spf66_data_cleaned/prophylactic_periods.txt")
+
+# discretisation into uniform windows 
+TIME_STEP <- 10
+N_COHORT <- nrow(patient_metadata)
+N_OBS <- STUDY_DURATION%/%TIME_STEP
+
+YEAR <- 365%/%TIME_STEP
+MAX_AGE <- 15*YEAR
+
+SHIFT_WINDOW <- 20
+MAX_PROP_MASKED <- 0.5
+```
+
+## Antimalarial treatment
+
+Antimalarial treatment records diverge on occasion from standard treatment regimens. Here, AM=artemether, AS=artesunate, CH=chloroquine, MF=mefloquine, QU=quinine, TE=tetracycline.
+
+```{r treatment_regimens, echo=FALSE}
+treatment_regimens <- malaria_consultations %>% 
+  mutate(Diagnosis=ifelse(FALCIP==1 & VIVAX==1, "Pv+Pf", ifelse(FALCIP==1, "Pf", "Pv")),
+         Treatment=ifelse(is.na(DRUG2), DRUG1, paste0(DRUG1, "+", DRUG2))) 
+
+treatment_regimens %>% 
+  group_by(Diagnosis, Treatment) %>% summarise(Count=n()) %>% 
+  arrange(Diagnosis, -Count) %>% 
+  kable %>% kable_styling(full_width = F) %>% scroll_box(height="300px")
+```
+
+Inter-consultation intervals exhibit patterns consistent with post-exposure prophylaxis.
+
+```{r prophylaxis, echo=FALSE, fig.width=10, fig.height=7}
+inter_recurrence <- treatment_regimens %>% split(f=.$VIN) %>% 
+  Filter(function(x) nrow(x)>1, .) %>% lapply(function(x) {
+    x <- x %>% arrange(RelativeTime)
+    return(data.frame(Baseline=head(x$Diagnosis, -1), Next=tail(x$Diagnosis, -1), 
+                      Interval=diff(x$RelativeTime), Treatment=head(x$Treatment, -1)))}) %>% 
+  bind_rows() 
+
+inter_recurrence_standard_treatment <- inter_recurrence %>%
+  subset((Baseline=="Pf" & Treatment %in% c("AS", "AS+MF")) |
+           (Baseline=="Pv" & Treatment=="CH") |
+           (Baseline=="Pv+Pf" & Treatment=="AS+MF")) %>%
+  mutate(Treatment=ifelse(Treatment=="AS+MF", "AS+MQ", 
+                          ifelse(Treatment=="CH", "CQ", Treatment)),
+         Prophylaxis=factor(ifelse(Next=="Pf" & Treatment=="CQ", "No protection",
+                            ifelse(Treatment %in% c("CQ", "AS+MQ") & Next!="Pf", 
+                                   "Long-lived protection", "Short-lived protection")),
+                            levels=c("No protection", "Short-lived protection",
+                                     "Long-lived protection")),
+    Next=paste0("Subsequent episode: ", Next),
+             Baseline=paste0("Baseline episode: ", Baseline, "\nTreatment: ", Treatment))
+
+inter_recurrence_counts <- inter_recurrence_standard_treatment %>%
+  group_by(Baseline, Next) %>% summarise(count=paste0("n=", n()))
+                         
+                         
+inter_recurrence_freq_plot <- ggplot() + 
+  annotate("rect", xmin=0, xmax=15, ymin=-Inf, ymax=Inf, fill="black", alpha=0.2) +
+  annotate("rect", xmin=15, xmax=35, ymin=-Inf, ymax=Inf, fill="darkorange", alpha=0.2) +
+  geom_histogram(data=inter_recurrence_standard_treatment,
+                 aes(x=Interval, y=stat(density), fill=Prophylaxis), binwidth=2, color="black", alpha=0.5, lwd=0.1) + 
+  geom_label(data=inter_recurrence_counts, aes(x=Inf, y=Inf, label=count), hjust=1, vjust=1) +
+  ggh4x::facet_grid2(cols=vars(Next), rows=vars(Baseline), scale="free_y", independent="y") +
+  coord_cartesian(xlim=c(0, 200)) + labs(color="Baseline episode treatment") +
+  guides(color=guide_legend(ncol=2, byrow=TRUE)) + 
+  xlab("Time to subsequent consultation (days)") + ylab("Frequency") +
+  theme_bw() + theme(plot.title = element_text(face="bold", hjust=0.5), 
+                     strip.text.y = element_text(angle=0))
+
+inter_recurrence_ecdf <- inter_recurrence_standard_treatment %>% 
+  subset(!grepl("Pv\\+Pf", Baseline) & !grepl("Pv\\+Pf", Next)) %>% 
+  ggplot() + 
+  stat_ecdf(aes(x=Interval, group=Baseline, color=Baseline)) + 
+  facet_wrap(vars(Next)) + 
+  coord_cartesian(xlim=c(0, 400)) +
+  xlab("Time to subsequent consultation (days)") + 
+  ylab("Empirical cumulative\ndistribution function") +
+  theme_bw() + theme(legend.position = "bottom",
+                     plot.title = element_text(face="bold", hjust=0.5))
+
+inter_recurrence_plot <- plot_grid(inter_recurrence_freq_plot, 
+               plot_grid(NULL, inter_recurrence_ecdf, NULL, rel_widths = c(0.15, 0.7, 0.15),
+                         nrow=1, labels=c("", "(B)", "")), ncol=1, rel_heights = c(2, 1.35), 
+               labels=c("(A)", ""))
+
+show(inter_recurrence_plot)
+
+pdf("Spf66_data_processed/interconsultation_intervals.pdf", width=10, height=7)
+show(inter_recurrence_plot)
+invisible(dev.off())
+```
+
+## Vivax after falciparum monoinfection
+Here, we consider the time from each recorded falciparum monoinfection (treated with either artesunate monotherapy or artesunate-mefloquine combination therapy) to the subsequent vivax episode. We perform Kaplan-Meier survival analysis, adjusting for right-censoring but *not* the loss of clinical follow-up due to documented absences from the camp. 
+
+```{r Pv_after_Pf}
+Pf_monoinf <- treatment_regimens %>% 
+  subset(FALCIP==1 & VIVAX==0 & Treatment %in% c("AS", "AS+MF")) %>%
+  transmute(VIN=VIN, PfTime=RelativeTime, Treatment=Treatment)
+
+Pv_after_Pf_monoinf <- treatment_regimens %>% subset(VIVAX==1) %>%
+  transmute(VIN=as.character(VIN), PvTime=RelativeTime) %>%
+  merge(Pf_monoinf) %>% subset(PvTime>PfTime) %>%
+  group_by(VIN, Treatment, PfTime) %>% dplyr::summarise(Time=min(PvTime)-PfTime) %>% 
+  unique %>% mutate(Status=1)
+
+no_Pv_after_Pf_monoinf <- Pf_monoinf %>% 
+  subset(!(as.character(VIN) %in% as.character(Pv_after_Pf_monoinf$VIN))) %>%
+  mutate(Time=as.numeric(difftime(patient_metadata[as.character(VIN), "WITH_DAT"], 
+                                  START_DATE, units = "days"))-PfTime, Status=0)
+
+first_Pv_after_Pf <- bind_rows(Pv_after_Pf_monoinf, no_Pv_after_Pf_monoinf) %>%
+  mutate(Group=as.numeric(Treatment=="AS"))
+first_Pv_after_Pf$Prev_Pv_ep <- apply(first_Pv_after_Pf, 1, function(x) 
+  treatment_regimens %>% subset(as.character(VIN)==as.character(x[["VIN"]]) & 
+             VIVAX==1 & RelativeTime<as.numeric(x["PfTime"])) %>% nrow)
+
+Kaplan_Meier_Pf_to_Pv_unmatched <- 
+  survfit(Surv(Time, Status) ~ Treatment, data=first_Pv_after_Pf)
+
+```
+
+```{r Pv_after_Pf_plot, fig.height=4, fig.width=6, echo=FALSE}
+KM_unmatched <- autoplot(Kaplan_Meier_Pf_to_Pv_unmatched) + coord_cartesian(xlim=c(0, 100)) +
+  labs(subtitle = "Unmatched (all falciparum monoinfections considered)") + 
+  ggtitle("Time to Pv after Pf monoinfection") + 
+  xlab("Time (days)") + ylab("Survival probability") + 
+  theme_bw() + theme(plot.title = element_text(hjust=0.5, face="bold"), 
+                     plot.subtitle = element_text(hjust=0.5),
+                     legend.position = "bottom")
+
+show(KM_unmatched)
+```
+
+We note however that artesunate monotherapy was typically administered to children with repeated falciparum episodes that were previously treated with artestunate-mefloquine combination therapy, as a pre-emptive measure to avoid mefloquine toxicity. As such, we match the treatment groups by the time of the initial falciparum monoinfection (to control for seasonality) and the number of previous vivax episodes.
+
+```{r Pv_after_Pf_matched}
+match_Pf_covariates <- 
+  matchit(Group ~ Prev_Pv_ep + PfTime, data=first_Pv_after_Pf,
+          distance="glm", method="nearest")
+
+matched_first_Pv_after_Pf <- match.data(match_Pf_covariates)
+
+Kaplan_Meier_Pf_to_Pv_matched <- 
+  survfit(Surv(Time, Status) ~ Treatment, data=matched_first_Pv_after_Pf)
+
+```
+
+```{r Pv_after_Pf_matched_plot, fig.height=4, fig.width=6, echo=FALSE}
+KM_matched <- autoplot(Kaplan_Meier_Pf_to_Pv_matched) + coord_cartesian(xlim=c(0, 100)) +
+  labs(subtitle = "Matched for no. previous Pv episodes, time of Pf monoinfection") + 
+  ggtitle("Time to Pv after Pf monoinfection") + 
+  xlab("Time (days)") + ylab("Survival probability") + 
+  theme_bw() + theme(plot.title = element_text(hjust=0.5, face="bold"), 
+                     plot.subtitle = element_text(hjust=0.5),
+                     legend.position = "bottom")
+show(KM_matched)
+
+pdf("Spf66_data_processed/Pv_after_Pf_KM.pdf", width=10, height=4)
+cowplot::plot_grid(KM_unmatched, KM_matched, nrow=1, align="vh", axis="tblr", scale=0.95, labels=c("(A)", "(B)"))
+invisible(dev.off())
+```
+
+## Platelet counts
+A key correlate of acute febrile malaria is thrombocytopemia (defined to be a platelet count below 150,000/mm^3). We thus consider platelet counts for each recorded consultation.
+
+```{r platelet_count_plots, echo=FALSE}
+treatment_regimens %>% group_by(Diagnosis) %>% 
+  summarise(`Below 150`=mean(PLATELET<150, na.rm=TRUE),
+            `150-200`=mean(PLATELET>=150 & PLATELET<=200, na.rm=TRUE),
+            `Above 200`=mean(PLATELET>200, na.rm=TRUE)) %>%
+  kable %>% kable_styling(full_width = F)
+
+platelet_density_plot <- ggplot(treatment_regimens) + 
+  geom_density(aes(x=PLATELET, group=Diagnosis, color=Diagnosis)) + 
+  scale_x_continuous(limits=c(0, 400), expand=c(0, 0)) + 
+  #annotate("rect", xmin=200, xmax=Inf, ymin=-Inf, ymax=Inf, alpha=0.1, fill="darkgray") + 
+  annotate("rect", xmin=-Inf, xmax=150, ymin=-Inf, ymax=Inf, alpha=0.1, fill="darkblue") + 
+  #annotate("text", x=75, y=Inf, label="thrombocytopemia", vjust=4) + 
+  #annotate("text", x=300, y=Inf, label="unusual for malaria", vjust=4) + 
+  scale_color_manual(values=c("#D55E00", "#009E73", "#0072B2")) +
+  xlab("Platelet count (× 100,000 per cubic mm of blood)") + ylab("Density") +
+  ggtitle("Platelet counts at clinical consultations") +
+  theme_bw() + theme(plot.title = element_text(hjust=0.5, face="bold"),
+                     legend.key.size = unit(0.05, "in"),
+                     legend.position = "bottom")
+
+show(platelet_density_plot)
+
+pdf("Spf66_data_processed/platelet_counts.pdf", height=3.5, width=6.5)
+show(platelet_density_plot)
+dev.off()
+
+```
+## Adjusting for post-exposure prophylaxis
+
+We model post exposure prophylaxis in two stages: an intial masking period (during which any hypnozoite activation events or immediate sporozoite development events are masked); and a subsequent bunching period (during which drug levels below the minimum inhibitory concentration delay, but do not complete suppress blood-stage infection). 
+
+```{r prophylactic_periods, echo=FALSE}
+prophylactic_periods %>% 
+  transmute(Treatment=ifelse(is.na(DRUG2), DRUG1, paste0(DRUG1, "+", DRUG2)), 
+            Pv_masking=VIVAX_MASKING, Pv_bunching=VIVAX_BUNCHING, 
+            Pf_masking=FALCIP_MASKING) %>% 
+  kable %>% kable_styling(full_width = F)
+```
+
+Any consultations lying within the prophylactic masking window of a previous consultation (dependent on antimalarial treatment regimen) are masked as possible treatment failures. 
+
+```{r screen_treatment_failure}
+malaria_consultations <- merge(malaria_consultations, prophylactic_periods) %>%
+  mutate(Treatment=ifelse(is.na(DRUG2), DRUG1, paste0(DRUG1, "+", DRUG2))) %>%
+  dplyr::select(VIN, CONSLT_N, CDATE, FALCIP, VIVAX, RelativeTime, Treatment,
+                VIVAX_MASKING, VIVAX_BUNCHING, FALCIP_MASKING, FALCIP_BUNCHING) %>%
+  mutate(RelativeTime=as.integer(RelativeTime))
+
+# stratify consultations by VIN and flag likely treatment failures
+consultations_by_VIN <- split(malaria_consultations, 
+                              f=as.character(malaria_consultations$VIN)) %>%
+  lapply(function(indiv_data) {
+  indiv_data <- indiv_data %>% arrange(RelativeTime) %>% mutate(infection_id=1)
+  
+  if (nrow(indiv_data)==1) return(indiv_data)
+  
+  inter_obs_times <- diff(indiv_data$RelativeTime)
+  
+  prophylactic_masking <- sapply(2:nrow(indiv_data), function(i) {
+    if (indiv_data[i, "FALCIP"]==0) return(indiv_data[i-1, "VIVAX_MASKING"])
+    if (indiv_data[i, "VIVAX"]==0) return(indiv_data[i-1, "FALCIP_MASKING"])
+    return(max(indiv_data[i-1, "FALCIP_MASKING"], indiv_data[i-1, "VIVAX_MASKING"]))
+  })
+
+  curr_id <- 1
+  for (i in 2:nrow(indiv_data)) {
+    if (inter_obs_times[i-1]>prophylactic_masking[i-1]) curr_id <- curr_id+1
+    indiv_data[i, "infection_id"] <- curr_id
+  }
+  
+  return(indiv_data)})
+
+potential_treatment_failure <- consultations_by_VIN %>% 
+  lapply(function(x) x %>% group_by(infection_id) %>% summarise(count=n()) %>% 
+           subset(count>1) %>% merge(x)) %>% Filter(function(x) nrow(x)>0, .) %>% bind_rows
+```
+
+A list of consultations marked as potential treatment failures is provided below.
+```{r potential_treatment_failure, echo=FALSE}
+potential_treatment_failure %>% kable %>% kable_styling(full_width = FALSE) %>% scroll_box(height="400px")
+```
+
+We reconcile potentially discordant diagnoses within the prophylactic masking window. 
+```{r reconcile_treatment_failure}
+# reconcile treatment failures
+malaria_consultations_reconciled <- 
+  lapply(consultations_by_VIN, function(indiv_data) {
+    indiv_data %>% split(f=.$infection_id) %>% lapply(function(x) {
+      
+      if (nrow(x)==1) return(bind_cols(x, near_treatment_failure=F))
+
+      # if VIVAX -> MIXED in quick succession, ignore first vivax episode 
+      # (only 2 cases, both 3 days or less)
+      if (x[nrow(x)-1, "FALCIP"]==0 & x[nrow(x)-1, "VIVAX"]==1 & 
+          x[nrow(x), "FALCIP"]==1 & x[nrow(x), "VIVAX"]==1) {
+        keep_episode <- setdiff(1:nrow(x), nrow(x)-1)
+        return(bind_cols(x[keep_episode,], near_treatment_failure=T))
+      }
+      
+      if (nrow(x)==1) return(bind_cols(x, near_treatment_failure=T))
+      
+      # if same diagnosis across successive consultations, record first infection
+      # but extend out masking period to span until the last treatment --- then add
+      # BUNCHING from last treatment
+      if (nrow(unique(x[,c("FALCIP", "VIVAX")]))==1) {
+        x[1, "VIVAX_MASKING"] <- max(x$RelativeTime)-min(x$RelativeTime)+tail(x$VIVAX_MASKING, 1)
+        x[1, "VIVAX_BUNCHING"] <- tail(x$VIVAX_BUNCHING, 1)
+        
+        if (x[1, "FALCIP"]==1) {
+          x[1, "FALCIP_MASKING"] <- max(x$RelativeTime)-min(x$RelativeTime)+tail(x$FALCIP_MASKING, 1)
+          x[1, "FALCIP_BUNCHING"] <- tail(x$FALCIP_BUNCHING, 1)
+        }
+      
+        x[1, "Treatment"] <- paste0(x$Treatment, collapse="/")
+        
+        return(bind_cols(x[1,], near_treatment_failure=T))
+      }
+      
+      # if FALCIP -> VIVAX or FALCIP -> MIXED but after the FALCIP masking period, 
+      # keep both entries but remove vivax masking/bunching for 
+      # first bout of treatment
+      if (x[1, "FALCIP"]==1 & x[1, "VIVAX"]==0 & x[2, "VIVAX"]==1 &
+          (x[1, "FALCIP"]==0 | diff(x$RelativeTime)>x[1, "FALCIP_MASKING"])) {
+        x[1, "VIVAX_MASKING"] <- x[1, "VIVAX_BUNCHING"] <- 0
+        return(bind_cols(x, near_treatment_failure=T))
+      }
+      
+      
+      # if MIXED -> VIVAX, keep first entry only but modify vivax masking/bunching
+      if (x[1, "FALCIP"]==1 & x[1, "VIVAX"]==1 & x[2, "FALCIP"]==0 & x[2, "VIVAX"]==1) {
+        x[1, "VIVAX_MASKING"] <- max(x$RelativeTime)-min(x$RelativeTime)+tail(x$VIVAX_MASKING, 1)
+        x[1, "VIVAX_BUNCHING"] <- tail(x$VIVAX_BUNCHING, 1)
+        x[1, "Treatment"] <- paste0(x$Treatment, collapse="/")
+        return(bind_cols(x[1,], near_treatment_failure=T))
+      }
+    }) %>% bind_rows()
+  }) %>% bind_rows()
+
+write_rds(malaria_consultations_reconciled, "Spf66_data_processed/malaria_consultations_reconciled.rds")
+```
+
+The number of episodes before and after screening for treatment failure are summarised below.
+
+```{r treatment_failure_counts, echo=FALSE}
+before_screening <- malaria_consultations %>% group_by(VIVAX, FALCIP) %>% 
+  summarise(count=n()) %>% mutate(screened="Before screening")
+after_screening <- malaria_consultations_reconciled %>% group_by(VIVAX, FALCIP) %>% 
+  summarise(count=n()) %>% mutate(screened="After screening")
+
+bind_rows(before_screening, after_screening) %>% 
+  mutate(Diagnosis=ifelse(FALCIP==1 & VIVAX==1, "Pv+Pf", ifelse(FALCIP==1, "Pf", "Pv"))) %>% 
+  reshape2::dcast(Diagnosis~screened, value.var="count") %>% 
+  kable %>% kable_styling(full_width = F)
+```
+
+Additionally, we adjust the total duration of clinical follow-up for left- and right-censoring, any documented absences from the camp and periods of complete prophylactic protection.
+
+```{r clinical_followup}
+# collate documented camp absences, enrolment/withdrawal dates
+documented_absences <- 
+  bind_rows(camp_absences %>% transmute(VIN=VIN, START=D_LEAVE, END=D_BACK),
+            patient_metadata %>% transmute(VIN=VIN, START=START_DATE, 
+                                           END=pmax(EX_DATE, START_DATE, na.rm=TRUE)),
+            patient_metadata %>% transmute(VIN=VIN, START=pmin(WITH_DAT, END_DATE, na.rm = TRUE),
+                                           END=END_DATE)) %>%
+  subset(END>START) %>%
+  mutate(START=as.numeric(difftime(START, START_DATE, units = "days")),
+         END=as.numeric(difftime(END, START_DATE, units = "days")))
+
+# masking periods include prophylaxis -- can therefore vary for Pf/Pv
+masking_periods <- list()
+
+masking_periods[["exc_prophylaxis"]] <- documented_absences %>%
+  mutate(START=as.integer(START), END=as.integer(END))
+
+masking_periods[["Pv"]] <- malaria_consultations_reconciled %>%
+  transmute(VIN=VIN, START=RelativeTime+1, END=RelativeTime+VIVAX_MASKING+1) %>%
+  subset(START<END) %>% bind_rows(documented_absences) %>%
+  mutate(START=as.integer(START), END=as.integer(END))
+
+masking_periods[["Pf"]] <- malaria_consultations_reconciled %>%
+  transmute(VIN=VIN, START=RelativeTime+1, END=RelativeTime+FALCIP_MASKING+1) %>%
+  subset(START<END) %>% bind_rows(documented_absences) %>%
+  mutate(START=as.integer(START), END=as.integer(END))
+
+masking_periods[["mixed"]] <- unique(bind_rows(masking_periods[["Pv"]], masking_periods[["Pf"]]))
+
+# https://stackoverflow.com/questions/15235821/merge-overlapping-ranges-into-unique-groups-in-dataframe
+# reconcile any overlapping masking periods (due to prophylaxis, camp absence or left/right censoring)
+masking_periods <- lapply(masking_periods, function(y) {
+  y %>% unique %>% split(f=as.character(.$VIN)) %>% lapply(function(x) {
+    x <- x %>% arrange(START)
+    ir <- IRanges(x$START, x$END)
+    x %>% mutate(my_group=subjectHits(findOverlaps(ir, reduce(ir)))) %>%
+      group_by(my_group) %>% 
+      dplyr::summarise(START=min(START), END=max(END)) %>% 
+      dplyr::select(-my_group) %>% return}) %>%
+    bind_rows(.id="VIN")})
+
+write_rds(masking_periods, "Spf66_data_processed/masking_periods.rds")
+```
+
+## Incidence of symptomatic malaria
+
+We calculate the incidence per individual as the quotient of the number of symptomatic malaria episodes (after screening treatment failure) and the total duration of clinical follow-up (corrected for left- and right-censoring, any documented absences from the camp and prophylactic masking).
+
+```{r incidence_per_individual}
+inf_count_by_indiv <- malaria_consultations_reconciled %>% 
+  group_by(VIN) %>% 
+  dplyr::summarise(N_Pf=sum(FALCIP), N_Pv=sum(VIVAX), N_mixed=sum(FALCIP*VIVAX)) %>%
+  merge(patient_metadata[, c("VIN", "AGE", "SEX_CONSENSUS")], all=TRUE) %>%
+  mutate(N_Pf=ifelse(is.na(N_Pf), 0, N_Pf), N_Pv=ifelse(is.na(N_Pv), 0, N_Pv),
+         N_mixed=ifelse(is.na(N_mixed), 0, N_mixed))
+
+susceptible_duration <- lapply(masking_periods, function(x) {
+  x %>% group_by(VIN) %>% 
+    summarise(TIME=difftime(END_DATE, START_DATE, units="days") - sum(END-START))}) %>%
+  bind_rows(.id="INF") %>% reshape::cast(VIN~INF) 
+
+incidence_by_indiv <- merge(inf_count_by_indiv, susceptible_duration, all=TRUE) %>%
+  mutate(Followup_mixed=ifelse(is.na(mixed), STUDY_DURATION, mixed)/365,
+         Followup_Pf=ifelse(is.na(Pf), STUDY_DURATION, Pf)/365, 
+         Followup_Pv=ifelse(is.na(Pv), STUDY_DURATION, Pv)/365,
+         Followup_exc_prophylaxis=ifelse(is.na(exc_prophylaxis), STUDY_DURATION,
+                                         exc_prophylaxis)/365,
+         Incidence_Pf=N_Pf/Followup_Pf, Incidence_Pv=N_Pv/Followup_Pv, 
+         Incidence_mixed=N_mixed/Followup_mixed) %>% 
+  dplyr::select(-exc_prophylaxis, -mixed, -Pf, -Pv)
+
+write_rds(incidence_by_indiv,
+          "Spf66_data_processed/incidence_by_individual.rds")
+```
+
+A summary of symptomatic malaria episodes in the SPf66 cohort is provided below.
+```{r incidence_summary}
+bind_rows(incidence_by_indiv %>% mutate(AGE=NA), incidence_by_indiv) %>% group_by(AGE) %>% 
+  summarise(`Number of children`=n(), 
+            `Mean follow-up per child`=mean(Followup_exc_prophylaxis),
+            `Number of Pv episodes`=sum(N_Pv),
+            `Children with at least 1 Pv episode`=sum(N_Pv>0),
+            `Mean Pv episodes per child`=mean(N_Pv),
+            `Pv incidence per child per year`=sum(N_Pv)/sum(Followup_Pv),
+            `Number of Pf episodes`=sum(N_Pf),
+            `Children with at least 1 Pf episode`=sum(N_Pf>0),
+            `Mean Pf episodes per child`=mean(N_Pf),
+            `Pf incidence per child per year`=sum(N_Pf)/sum(Followup_Pf),
+            `Number of mixed episodes`=sum(N_mixed),
+            `Children with at least 1 mixed episode`=sum(N_mixed>0),
+            `Mean mixed episodes per child`=mean(N_mixed),
+            `Mixed incidence per child per year`=sum(N_mixed)/sum(Followup_mixed)) %>%
+  kable %>% kable_styling %>% scroll_box(width="100%", height="100%")
+```
+
+### Incidence by window
+We calculate the incidence of symptomatic malaria in the SPf66 cohort (aggregated over ages) in `r TIME_STEP*2` day windows, with a moving average across half-windows. 
+
+```{r incidence_by_window}
+MOVING_AV_TIME_STEP <- 2*TIME_STEP
+
+patient_counts_with_masking <- lapply(masking_periods[c("Pv", "Pf", "mixed")], function(inf_type) {
+  lapply(seq(1.5, STUDY_DURATION%/%MOVING_AV_TIME_STEP, 0.5), function(x) {
+    masked_indiv <- 
+      inf_type %>% subset((START<=(x-1)*MOVING_AV_TIME_STEP & END>=(x-1)*MOVING_AV_TIME_STEP) | 
+                            (START<=x*MOVING_AV_TIME_STEP & END>=x*MOVING_AV_TIME_STEP)) %>%
+      mutate(prop=(pmin(x*MOVING_AV_TIME_STEP, END)-pmax((x-1)*MOVING_AV_TIME_STEP,
+                                                         START))/MOVING_AV_TIME_STEP) %>%
+      dplyr::summarise(N_patients_masked=sum(prop)) %>%
+      mutate(WINDOW=x)}) %>% 
+    bind_rows %>% 
+    merge(expand.grid(WINDOW=seq(1.5, STUDY_DURATION%/%MOVING_AV_TIME_STEP, 0.5))) %>%
+    mutate(N_patients_masked=ifelse(is.na(N_patients_masked), 0, N_patients_masked),
+           N_patients=N_COHORT-N_patients_masked,
+           WINDOW_START=WINDOW-1)})
+
+
+malaria_consultations_screened <- malaria_consultations_reconciled %>%
+  dplyr::select(VIN, FALCIP, VIVAX, RelativeTime)
+
+# clinical case counts -- moving average, half-windows 
+clinical_case_counts <- 
+  lapply(seq(1.5, STUDY_DURATION%/%MOVING_AV_TIME_STEP, 0.5), function(x) {
+    malaria_consultations_screened %>% 
+      subset(RelativeTime>=(x-1)*MOVING_AV_TIME_STEP & RelativeTime<=x*MOVING_AV_TIME_STEP) %>%
+      dplyr::summarise(N_Pf=sum(FALCIP),
+                       N_Pv=sum(VIVAX),
+                       N_mixed=sum(FALCIP*VIVAX)) %>%
+      mutate(WINDOW=x)}) %>% 
+  bind_rows %>% 
+  merge(expand.grid(WINDOW=seq(1.5, STUDY_DURATION%/%MOVING_AV_TIME_STEP, 0.5))) %>%
+  mutate(N_Pf=ifelse(is.na(N_Pf), 0, N_Pf),
+         N_Pv=ifelse(is.na(N_Pv), 0, N_Pv),
+         N_mixed=ifelse(is.na(N_mixed), 0, N_mixed),
+         WINDOW_START=WINDOW-1)
+
+incidence_by_window <- 
+  list(Pv=clinical_case_counts %>% 
+         transmute(WINDOW=WINDOW, WINDOW_START=WINDOW_START, N=N_Pv),
+       Pf=clinical_case_counts %>% 
+         transmute(WINDOW=WINDOW, WINDOW_START=WINDOW_START, N=N_Pf),
+       mixed=clinical_case_counts %>% 
+         transmute(WINDOW=WINDOW, WINDOW_START=WINDOW_START, N=N_mixed)) %>%
+  purrr::map2(patient_counts_with_masking, function(n_cases, n_patients) {
+    calc_incidence <- merge(n_cases, n_patients, all=TRUE) %>%
+      mutate(WINDOW=as.numeric(WINDOW))
+    calc_incidence[is.na(calc_incidence)] <- 0
+    return(calc_incidence)}) %>%
+  lapply(function(x) {
+    x %>% mutate(incidence=N/N_patients*(365/MOVING_AV_TIME_STEP),
+           Date=hours(WINDOW*MOVING_AV_TIME_STEP*24) + ymd(START_DATE))}) %>% 
+  bind_rows(.id="Diagnosis")
+
+write_rds(incidence_by_window, "Spf66_data_processed/incidence_by_window.rds")
+```
+
+```{r incidence_by_window_plot, fig.width=10, fig.height=3.5, echo=FALSE}
+incidence_by_window_plot <- 
+  ggplot(incidence_by_window, aes(x=as.Date(Date), y=incidence/12, color=Diagnosis, shape=Diagnosis)) + 
+  geom_line(lwd=0.25) + geom_point() + 
+  scale_x_date(expand=c(0,0), limits = c(START_DATE, END_DATE)) + 
+  scale_color_manual(values=c("#D55E00", "#009E73", "#0072B2")) +
+  #scale_y_continuous(trans="log10") +
+  xlab("Date") + ylab("Incidence per child per month") +
+  labs(title="Incidence of symptomatic malaria in the SPf66 trial",
+       subtitle=paste0("calculated in ", MOVING_AV_TIME_STEP, 
+                      " day windows, moving average across half-windows")) + 
+  theme_bw() + theme(plot.subtitle = element_text(hjust=0.5),
+                        plot.title = element_text(face="bold", hjust=0.5))
+
+show(incidence_by_window_plot)
+```
+
+### Age structure in incidence
+
+We calculate the incidence rate, stratified by age at enrolment, as the quotient of the total number of symptomatic malaria episodes recorded for an age group and the cumulative duration of clinical follow-up for the age group.
+```{r incidence_rate_by_age}
+age_counts <- patient_metadata %>% group_by(AGE) %>% summarise(count=n()) %>%
+  mutate(count=factor(paste0(AGE, " years old\n(n=", count, ")"),
+                      levels=paste0(2:15, " years old\n(n=", count, ")")))
+
+N_BOOTSTRAP_REPLICATES <- 2000
+incidence_bootstrap_resampling <- lapply(1:N_BOOTSTRAP_REPLICATES, function(i) {
+  incidence_by_indiv[sample(1:N_COHORT, N_COHORT, replace=T),]})
+
+incidence_by_indiv <- merge(incidence_by_indiv, age_counts)
+
+incidence_rate <- list()
+
+incidence_rate[["mixed"]] <- lapply(incidence_bootstrap_resampling, function(x) {
+  x %>% group_by(AGE) %>% summarise(mean_incidence=sum(N_mixed)/sum(Followup_mixed))}) %>% 
+  bind_rows(.id="iter") %>%
+  group_by(AGE) %>% 
+  summarise(`2.5%`=quantile(mean_incidence, 0.025),
+            `50%`=quantile(mean_incidence, 0.5),
+            `97.5%`=quantile(mean_incidence, 0.975))
+
+
+incidence_rate[["Pf"]] <- lapply(incidence_bootstrap_resampling, function(x) {
+  x %>% group_by(AGE) %>% summarise(mean_incidence=sum(N_Pf)/sum(Followup_Pf))}) %>% 
+  bind_rows(.id="iter") %>%
+  group_by(AGE) %>% 
+  summarise(`2.5%`=quantile(mean_incidence, 0.025),
+            `50%`=quantile(mean_incidence, 0.5),
+            `97.5%`=quantile(mean_incidence, 0.975))
+
+incidence_rate[["Pv"]] <- lapply(incidence_bootstrap_resampling, function(x) {
+  x %>% group_by(AGE) %>% summarise(mean_incidence=sum(N_Pv)/sum(Followup_Pv))}) %>% 
+  bind_rows(.id="iter") %>%
+  group_by(AGE) %>% 
+  summarise(`2.5%`=quantile(mean_incidence, 0.025),
+            `50%`=quantile(mean_incidence, 0.5),
+            `97.5%`=quantile(mean_incidence, 0.975))
+```
+
+```{r incidence_rate_by_age_plot, fig.width=10, fig.height=3.5, echo=FALSE}
+incidence_rate_plot <- ggplot(bind_rows(incidence_rate, .id="Diagnosis"),
+                         aes(x=AGE, y=`50%`, ymin=`2.5%`, ymax=`97.5%`)) +
+  geom_errorbar(width = 0.4, position=position_dodge(width=0.5), lwd=0.4) +
+  geom_point(position=position_dodge(width=0.5), size=2) +
+  xlab("Age (years)") + 
+  ylab("Incidence rate\n(symptomatic episodes per year)") + 
+  ggtitle("Aggregated incidence rate of symptomatic malaria") +
+  scale_x_continuous(breaks=2:15) + scale_y_continuous(limits=c(0, NA)) +
+  #scale_color_manual(values=c("#D55E00", "#009E73", "#0072B2")) +
+  ggh4x::facet_wrap2(vars(Diagnosis), nrow=1, scale="free_y") +
+  theme_bw() + theme(plot.title = element_text(face="bold", hjust=0.5),
+                     strip.text = element_text(size=11),
+                     strip.background = element_rect(fill="#f0f0f0"),
+                     legend.position = "none")
+
+show(incidence_rate_plot)
+```
+
+We additionally apply two non-parametric rank sum tests (namely, the Kruskall-Wallis test and the Mack-Wolfe test for umbrella alternatives with unknown peak) to the incidence per individual, stratified by age group.
+
+```{r incidence_indiv_by_age}
+kruskall_wallis_pvals <- 
+  data.frame(variable=c("mixed", "Pf", "Pv"),
+             pvalue=c(kruskal.test(Incidence_mixed ~ AGE, data = incidence_by_indiv)$p.value,
+                      kruskal.test(Incidence_Pf ~ AGE, data = incidence_by_indiv)$p.value,
+                      kruskal.test(Incidence_Pv ~ AGE, data = incidence_by_indiv)$p.value)) %>%
+  mutate(pvalue=paste0("Kruskall-Wallis test: p-value ", round(pvalue, digits=5)))
+
+mack_wolfe_Pv <- mackWolfeTest(Incidence_Pv ~ AGE, incidence_by_indiv, nperm=10000)
+```
+
+```{r incidence_indiv_by_age_plot, fig.width=10, fig.height=4, echo=FALSE}
+mack_wolfe <- data.frame(variable="Pv",
+                            pvalue=paste0("Mack-Wolfe test: peak at age ", 
+                                          as.numeric(gsub("p = ", "", stringr::str_extract(mack_wolfe_Pv$alternative, "p = [0-9]+"))) + 1,
+                                          ", p-value ", mack_wolfe_Pv$p.value))
+
+incidence_by_indiv_melted <- incidence_by_indiv %>% 
+  transmute(AGE=AGE, mixed=Incidence_mixed, Pf=Incidence_Pf, Pv=Incidence_Pv) %>% 
+  reshape2::melt(id="AGE")
+
+incidence_by_indiv_plot <- ggplot() + 
+  stat_ecdf(data=incidence_by_indiv_melted, aes(x=value, group=AGE, color=AGE)) + 
+  geom_label(data=kruskall_wallis_pvals, aes(x=Inf, y=0, label=pvalue), hjust=1.05, vjust=0) +
+  geom_label(data=mack_wolfe, aes(x=Inf, y=0.1, label=pvalue), hjust=1.05, vjust=0) +
+  ggh4x::facet_wrap2(vars(variable), nrow=1) + 
+  coord_cartesian(xlim=c(0, 10)) +
+  scale_color_viridis_c(breaks=2:15, name="Age (years)") + 
+  xlab("Total number of symptomatic episodes per year") + 
+  ylab("Empirical cumulative\ndistribution function") + 
+  ggtitle("Incidence of symptomatic malaria per child") +
+  theme_bw() + theme(plot.title = element_text(face="bold", hjust=0.5),
+                     strip.text = element_text(size=11),
+                     strip.background = element_rect(fill="#f0f0f0"),
+                     legend.key.width = unit(0.75, "in"),
+                     legend.position = "bottom")
+
+show(incidence_by_indiv_plot)
+
+pdf("Spf66_data_processed/Spf66_age_structure.pdf", height=8, width=12)
+show(cowplot::plot_grid(incidence_rate_plot, incidence_by_indiv_plot, labels=c("(A)", "(B)"),
+                        ncol=1, align="vh", axis="lr", rel_heights = c(1, 1.25)))
+invisible(dev.off())
+```
+
+## Pre-processing for model calibration
+
+### Longitudinal recurrence data
+We seek to calibrate the within-host model to granular temporal recurrence data. Recorded clinical episodes for individuals aged 7 at enrolment are visualised below.
+
+```{r granular data, fig.width=10, fig.height=3.5, echo=FALSE}
+patient_metadata_7yo <- patient_metadata %>% subset(!is.na(AGE)) %>%
+  mutate(WTIH_DAT=if_else(is.na(WITH_DAT), END_DATE, WITH_DAT),
+         EX_DATE=if_else(is.na(EX_DATE), START_DATE, EX_DATE)) %>%
+  arrange(AGE, WITH_DAT, EX_DATE) %>% subset(AGE==7)
+
+malaria_consultations_reconciled_7yo <- malaria_consultations_reconciled %>% 
+  merge(patient_metadata_7yo[,c("VIN", "AGE")]) %>%
+  mutate(VIN=factor(VIN, levels=patient_metadata_7yo$VIN),
+         Diagnosis=ifelse(FALCIP==0, "Pv", ifelse(VIVAX==0, "Pf", "mixed")))
+patient_metadata_7yo$VIN <- factor(patient_metadata_7yo$VIN, levels=patient_metadata_7yo$VIN)
+
+granular_data_7yo <- ggplot() + 
+  geom_segment(data=patient_metadata_7yo,
+               aes(x=EX_DATE, xend=if_else(is.na(WITH_DAT), END_DATE, WITH_DAT), 
+                   y=VIN, yend=VIN), alpha=0.1,
+               lwd=0.005, arrow=arrow(angle=90, ends="both", length=unit(0.02, "inches"))) + 
+  geom_point(data=malaria_consultations_reconciled_7yo, 
+             aes(x=CDATE, y=VIN, color=Diagnosis, shape=Diagnosis), cex=1.3) + 
+  scale_x_date(expand=c(0,0), limits = c(START_DATE, END_DATE)) + 
+  scale_color_manual(values=c("#D55E00", "#009E73", "#0072B2")) +
+  xlab("Date") + ylab("Individuals") + 
+  labs(title="Individual patterns of symptomatic malaria",
+       subtitle=paste0("n=", sum(patient_metadata_7yo$AGE==7), 
+                       " individuals, 7 years of age at enrollment")) + 
+  guides(colour = guide_legend(override.aes = list(size=2))) +
+  theme_bw() + theme(axis.text.y = element_blank(),
+                     axis.ticks.y = element_blank(),
+                     axis.line.y = element_blank(),
+                     panel.border = element_blank(),
+                     panel.grid.major.y = element_blank(), 
+                     panel.grid.minor.y = element_blank(),
+                     plot.subtitle = element_text(hjust=0.5),
+                     plot.title = element_text(face="bold", hjust=0.5))
+
+show(granular_data_7yo)
+
+pdf("Spf66_data_processed/Spf66_data_overview.pdf",
+    height=7, width=10)
+show(cowplot::plot_grid(incidence_by_window_plot, granular_data_7yo,
+                        ncol=1, align="v", axis="lr", labels=c("(A)", "(B)")))
+invisible(dev.off())
+```
+
+For simplicity, we discretise observations into `r TIME_STEP` day windows. We assign a ternary infection state to each window: a contiguous string of Bs indicates a period of prophylactic bunching, culminating in a symptomatic episodes; C indicates a symptomatic episode within a window, with no prophylactic bunching; N indicates a window without a symptomatic episode, that does not fall into the prophylactic bunching period of a subsequent episode and for which clinical follow-up was performed for at least `r TIME_STEP*(1-MAX_PROP_MASKED)` days; while remaining windows with less than `r TIME_STEP*MAX_PROP_MASKED` days of clinical follow-up are masked as missing. Prior to adjusting for prophylaxis, we shift each clinical consultation to the midpoint of the relevant window.
+
+```{r discretised_inf_states}
+keep_VIN <- as.character(patient_metadata$VIN)
+
+malaria_consultations_reconciled <- malaria_consultations_reconciled %>%
+  mutate(VIN=factor(VIN, levels=keep_VIN),
+         RelativeTime=TIME_STEP*(RelativeTime%/%TIME_STEP)+TIME_STEP/2)
+
+documented_absences <- masking_periods[["exc_prophylaxis"]] %>% 
+  mutate(VIN=factor(VIN, levels=keep_VIN))
+
+# https://stackoverflow.com/questions/15235821/merge-overlapping-ranges-into-unique-groups-in-dataframe
+# apply masking periods to shifted consultation times
+masking_by_VIN <- malaria_consultations_reconciled %>% 
+  subset(VIVAX_MASKING>0) %>%
+  transmute(VIN=VIN, START=RelativeTime, END=RelativeTime+VIVAX_MASKING) %>%
+  bind_rows(documented_absences) %>%
+  mutate(START=as.integer(START), END=as.integer(END)) %>%
+  unique %>% split(f=.$VIN) %>% lapply(function(x) {
+    x <- x %>% arrange(START)
+    ir <- IRanges(x$START, x$END)
+    x %>% mutate(my_group=subjectHits(findOverlaps(ir, reduce(ir)))) %>%
+      group_by(my_group) %>% 
+      dplyr::summarise(START=min(START), END=max(END)) %>% 
+      dplyr::select(-my_group) %>% return})
+
+bunching_by_VIN <- malaria_consultations_reconciled %>% 
+  subset(VIVAX_MASKING>0 & VIVAX_BUNCHING>0) %>% split(f=.$VIN) %>% 
+  lapply(function(x) {
+    x %>% transmute(START=RelativeTime+VIVAX_MASKING, 
+              END=RelativeTime+VIVAX_MASKING+VIVAX_BUNCHING)})
+
+consultation_times_by_VIN <- malaria_consultations_reconciled %>% 
+  subset(VIVAX==1) %>% split(f=.$VIN) %>% lapply(function(x) x$RelativeTime)
+
+  
+# PROP_MASKING: proportion of a window that must be spanned by 
+# prophylaxis or a documented camp absence to mandate masking
+
+# string of Bs: prophylactic bunching, ending with detected clinical infection
+# C: clinical infection within window, no bunching
+# N: no clinical infection within window
+# NA: masking (either due to prophylaxis or a documented absence from the camp)
+discretised_inf_state <- function(consultation_times, masking, bunching,
+                                  PROP_MASKED, PROP_BUNCHING=0.5) {
+  inf_state <- rep("N", N_OBS)
+  
+  # calculate proportion of each window that is masked due to prophylaxis or absence
+  proportion_masked <- rep(0, N_OBS)
+  masking_windows <- masking %>% 
+    transmute(window_start=START%/%TIME_STEP+1, window_end=END%/%TIME_STEP+1, 
+              prop_window_start=1-(START%%TIME_STEP)/TIME_STEP, 
+              prop_window_end=(END%%TIME_STEP)/TIME_STEP)
+  
+  fully_masked <- masking_windows %>% subset(window_end-window_start>1) %>% 
+    apply(1, function(x) (x[1]+1):(x[2]-1)) 
+  
+  if (is.list(fully_masked)) fully_masked <- do.call(c, fully_masked)
+  
+  inf_state[fully_masked] <- "M"
+  
+  proportion_masked[masking_windows$window_start] <- 
+    proportion_masked[masking_windows$window_start] + masking_windows$prop_window_start
+  
+  proportion_masked[masking_windows$window_end] <- 
+    proportion_masked[masking_windows$window_end] + masking_windows$prop_window_end
+  
+  inf_state[which(proportion_masked>PROP_MASKED)] <- "M"
+  
+  # mark clinical consultation times
+  clin_windows <- consultation_times%/%TIME_STEP+1
+  inf_state[clin_windows] <- "C"
+  
+  # identify collisions between detected infections + propyhlactic bunching
+  bunching_clin_collisions <- 
+    findOverlaps(IRanges(bunching$START, bunching$END), 
+                 IRanges(consultation_times)) %>% as.data.frame %>%
+    transmute(START=bunching[queryHits, "START"], 
+              BUNCHING_START=ifelse(1-(START%%TIME_STEP)/TIME_STEP>PROP_BUNCHING, 
+                                    START%/%TIME_STEP+1, START%/%TIME_STEP+2),
+              CLIN=consultation_times[subjectHits]%/%TIME_STEP+1) %>%
+    subset(BUNCHING_START<CLIN) %>% select(-START) %>%
+    apply(1, function(x) x[1]:x[2]) 
+  
+  if (is.list(bunching_clin_collisions)) bunching_clin_collisions <- do.call(c, bunching_clin_collisions)
+  
+  inf_state[bunching_clin_collisions] <- "B"
+  return(inf_state[1:N_OBS])
+}
+
+inf_states_by_VIN <- lapply(keep_VIN, function(my_VIN) {
+  discretised_inf_state(consultation_times_by_VIN[[my_VIN]],
+                        masking_by_VIN[[my_VIN]], 
+                        bunching_by_VIN[[my_VIN]],
+                        MAX_PROP_MASKED)})
+names(inf_states_by_VIN) <- keep_VIN
+
+write_rds(inf_states_by_VIN,
+          "Spf66_data_processed/discretised_infection_matrix.rds")
+```
+
+```{r discretised_inf_states_plot, fig.width=10, fig.height=7, echo=FALSE}
+inf_state_plot <- t(bind_rows(inf_states_by_VIN, .id="VIN")) %>% as.data.frame %>%
+  tibble::rownames_to_column(var="VIN") %>% 
+  mutate(AGE=patient_metadata[as.character(VIN), "AGE"]) %>% 
+  subset(AGE==7) %>% dplyr::select(-AGE) %>%
+  reshape2::melt(id="VIN") %>%
+  mutate(variable=as.numeric(gsub("V", "", variable)),
+         VIN=factor(VIN, levels=patient_metadata_7yo$VIN)) %>%
+  ggplot() + 
+  geom_tile(aes(x=variable, y=VIN, fill=value), col="black", lwd=0.1) + 
+  scale_x_continuous(expand=c(0,0)) + 
+  scale_fill_manual(values=c("pink", "red", "grey", "white"), 
+                    labels=c("Prophylactic bunching", "Clinical consultation", 
+                             "Masking", "No clinical consultation"), name="State") + 
+  xlab(paste0("Discretised window (", TIME_STEP, " days)")) + ylab("Individuals") +
+  labs(title="Discretised vivax infection states",
+       subtitle=paste0("n=", sum(patient_metadata_7yo$AGE==7), 
+                       " individuals, 7 years of age at enrollment")) + 
+  theme_bw() + theme(axis.text.y = element_blank(),
+                     axis.ticks.y = element_blank(),
+                     axis.line.y = element_blank(),
+                     plot.subtitle = element_text(hjust=0.5),
+                     plot.title = element_text(face="bold", hjust=0.5),
+                     legend.position = "bottom")
+
+show(inf_state_plot)
+
+pdf("Spf66_data_processed/discretised_infection_states.pdf",
+    height=7, width=10)
+show(inf_state_plot)
+invisible(dev.off())
+```
+
+### Seasonality
+We infer seasonality in the force of inoculation for *P. vivax* from relative seasonal fluctuations in the incidence of falciparum malaria. Specifically, we fit a smoothing spline to the incidence of symptomatic falciparum (calculated in `r TIME_STEP*2` day windows, with a moving average across half-windows) to obtain a discretised seasonality vector. To recover the force of inoculation for *P. vivax*, we apply a set of scaling factors to this seasonality vector (separate factors before and after window `r SHIFT_WINDOW`). We assume a constant force of inoculation prior to the study, equivalent to the mean force of inoculation in the first `r SHIFT_WINDOW` windows of the study period.
+
+```{r seasonality}
+Pf_incidence <- incidence_by_window %>% subset(Diagnosis=="Pf") %>% 
+  transmute(WINDOW=2*TIME_STEP*(WINDOW_START+0.5), incidence=incidence)
+
+seasonality_spline <- smooth.spline(Pf_incidence, df=24)
+
+seasonality_pred <- predict(seasonality_spline, seq(1, N_OBS, 0.025)*TIME_STEP) %>% bind_rows
+
+# normalise so average in first year is 1
+# assume constant historical FORI, set to mean in first year
+seasonality_vector <- predict(seasonality_spline, TIME_STEP*(1:N_OBS))$y
+normalise_fact <- mean(seasonality_vector[1:SHIFT_WINDOW])
+seasonality_vector <- seasonality_vector/normalise_fact
+seasonality_vector <- c(rep(1, MAX_AGE), seasonality_vector)
+
+write_rds(seasonality_vector, "Spf66_data_processed/seasonality_vector.rds")
+```
+
+The normalisation factor is `r normalise_fact` (relevant for calculating the ratio of the force of inoculation for vivax and falciparum respectively). After normalisation, the mean seasonality value after the shift window is `r mean(tail(seasonality_vector, N_OBS-SHIFT_WINDOW))`.
+
+```{r seasonality_plot, fig.width=7, fig.height=3, echo=FALSE}
+seasonality_spline_plot <- ggplot() + 
+  annotate("rect", xmin=0, xmax=20, ymin=-Inf, ymax=Inf, fill="black", alpha=0.2) +
+  geom_line(data=seasonality_pred, aes(x=x/TIME_STEP, y=y/normalise_fact), lwd=0.8, col="blue") + 
+  geom_point(data=Pf_incidence, aes(x=WINDOW/TIME_STEP, y=incidence/normalise_fact)) + 
+  geom_line(data=Pf_incidence, aes(x=WINDOW/TIME_STEP, y=incidence/normalise_fact), lwd=0.4, lty=3) + 
+  xlab(paste0("Window (length ", TIME_STEP, " days)")) + 
+  ylab("Relative seasonal fluctuation") + theme_bw()
+
+show(seasonality_spline_plot)
+
+pdf("Spf66_data_processed/seasonality_estimate.pdf", width=7, height=3)
+show(seasonality_spline_plot)
+invisible(dev.off())
+```
+
+
+

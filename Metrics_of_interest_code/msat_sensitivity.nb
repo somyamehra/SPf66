@@ -1,0 +1,162 @@
+(* Content-type: application/vnd.wolfram.mathematica *)
+
+(*** Wolfram Notebook File ***)
+(* http://www.wolfram.com/nb *)
+
+(* CreatedBy='Mathematica 13.0' *)
+
+(*CacheID: 234*)
+(* Internal cache information:
+NotebookFileLineBreakTest
+NotebookFileLineBreakTest
+NotebookDataPosition[       158,          7]
+NotebookDataLength[      5496,        154]
+NotebookOptionsPosition[      5052,        139]
+NotebookOutlinePosition[      5448,        155]
+CellTagsIndexPosition[      5405,        152]
+WindowFrame->Normal*)
+
+(* Beginning of Notebook Content *)
+Notebook[{
+Cell[BoxData[
+ RowBox[{
+  RowBox[{"(*", " ", 
+   RowBox[{
+   "Sensitivity", " ", "of", " ", "recent", " ", "recurrence", " ", "as", " ",
+     "a", " ", "predictor", " ", "of", " ", "hypnozoite", " ", "carriage"}], 
+   " ", "*)"}], "\[IndentingNewLine]", 
+  RowBox[{
+   RowBox[{
+    RowBox[{"Sensitivity", "[", 
+     RowBox[{
+     "T_", ",", "\[Eta]_", ",", "\[Nu]_", ",", "p_", ",", "\[Lambda]_", ",", 
+      "\[Theta]_"}], "]"}], "=", 
+    RowBox[{"1", "+", 
+     RowBox[{
+      RowBox[{
+       RowBox[{"(", 
+        RowBox[{"\[Eta]", "/", 
+         RowBox[{"(", 
+          RowBox[{"\[Theta]", "*", 
+           RowBox[{"Log", "[", 
+            RowBox[{"1", "+", 
+             RowBox[{"\[Nu]", "*", "p"}]}], "]"}]}], ")"}]}], ")"}], "^", 
+       RowBox[{"(", 
+        RowBox[{"\[Lambda]", "/", "\[Theta]"}], ")"}]}], "*", 
+      RowBox[{"(", 
+       RowBox[{
+        RowBox[{"HurwitzZeta", "[", 
+         RowBox[{
+          RowBox[{"\[Lambda]", "/", "\[Theta]"}], ",", 
+          RowBox[{"1", "+", 
+           RowBox[{"\[Eta]", "*", 
+            RowBox[{
+             RowBox[{"(", 
+              RowBox[{
+               RowBox[{"1", "/", "\[Theta]"}], "+", 
+               RowBox[{"T", "*", 
+                RowBox[{"\[Nu]", "/", 
+                 RowBox[{"(", 
+                  RowBox[{"1", "+", "\[Nu]"}], ")"}]}]}]}], ")"}], "/", 
+             RowBox[{"Log", "[", 
+              RowBox[{"1", "+", 
+               RowBox[{"\[Nu]", "*", "p"}]}], "]"}]}]}]}]}], "]"}], "-", 
+        RowBox[{"HurwitzZeta", "[", 
+         RowBox[{
+          RowBox[{"\[Lambda]", "/", "\[Theta]"}], ",", 
+          RowBox[{
+           RowBox[{"(", 
+            RowBox[{
+             RowBox[{"\[Eta]", "/", "\[Theta]"}], "+", 
+             RowBox[{"\[Eta]", "*", "T"}], "+", 
+             RowBox[{"Log", "[", 
+              RowBox[{"1", "+", 
+               RowBox[{"\[Nu]", "*", "p", "*", 
+                RowBox[{"(", 
+                 RowBox[{"1", "-", 
+                  RowBox[{"Exp", "[", 
+                   RowBox[{
+                    RowBox[{"-", "\[Eta]"}], "*", "T"}], "]"}]}], ")"}]}]}], 
+              "]"}], " ", "+", " ", 
+             RowBox[{
+              RowBox[{"Log", "[", 
+               RowBox[{"1", "-", 
+                RowBox[{
+                 RowBox[{"(", 
+                  RowBox[{"1", "+", "\[Nu]"}], ")"}], "*", 
+                 RowBox[{
+                  RowBox[{"(", 
+                   RowBox[{"1", "-", 
+                    RowBox[{"Exp", "[", 
+                    RowBox[{
+                    RowBox[{"-", "\[Eta]"}], "*", "T"}], "]"}]}], ")"}], "/", 
+                  
+                  RowBox[{"(", 
+                   RowBox[{"1", "+", "\[Nu]", "-", 
+                    RowBox[{"\[Nu]", "*", "p", "*", 
+                    RowBox[{"Exp", "[", 
+                    RowBox[{
+                    RowBox[{"-", "\[Eta]"}], "*", "T"}], "]"}]}]}], 
+                   ")"}]}]}]}], "]"}], "/", 
+              RowBox[{"(", 
+               RowBox[{"1", "+", "\[Nu]"}], ")"}]}]}], ")"}], "/", 
+           RowBox[{"Log", "[", 
+            RowBox[{"1", "+", 
+             RowBox[{"\[Nu]", "*", "p"}]}], "]"}]}]}], "]"}]}], ")"}]}]}]}], 
+   ";"}]}]], "Input",
+ CellChangeTimes->{{3.908475507144393*^9, 3.9084755224279613`*^9}, {
+   3.908475556571679*^9, 3.908475613439598*^9}, {3.908475645279203*^9, 
+   3.908475823100768*^9}, {3.908475861960806*^9, 3.908475886972743*^9}, {
+   3.9084759222167463`*^9, 3.908475932580195*^9}, 3.9084759678734417`*^9},
+ CellLabel->"In[81]:=",ExpressionUUID->"7cc7e69d-33a4-4d06-b02c-6e7d39e33b4f"],
+
+Cell[BoxData[{
+ RowBox[{
+  RowBox[{"SetDirectory", "[", 
+   RowBox[{"NotebookDirectory", "[", "]"}], "]"}], ";"}], "\n", 
+ RowBox[{
+  RowBox[{"params", "=", 
+   RowBox[{
+   "Import", "[", 
+    "\"\<recent_recur_sensitivity_stationary_het_params.csv\>\"", "]"}]}], 
+  ";"}], "\[IndentingNewLine]", 
+ RowBox[{
+  RowBox[{"ComputedSensitivity", "=", 
+   RowBox[{"MapApply", "[", 
+    RowBox[{"Sensitivity", ",", 
+     RowBox[{"Drop", "[", 
+      RowBox[{"params", ",", "1"}], "]"}]}], "]"}]}], 
+  ";"}], "\[IndentingNewLine]", 
+ RowBox[{
+  RowBox[{"Export", "[", 
+   RowBox[{
+   "\"\<recent_recur_sensitivity_stationary_het_Mathematica.dat\>\"", ",", 
+    "ComputedSensitivity"}], "]"}], ";"}]}], "Input",
+ CellChangeTimes->{{3.9084777382435913`*^9, 3.908477795002823*^9}, {
+  3.908477838431374*^9, 3.908477852166152*^9}, {3.908478260968672*^9, 
+  3.9084782639076138`*^9}},
+ CellLabel->"In[82]:=",ExpressionUUID->"2c37bcdd-d678-4b6a-ac51-9b2deedda1ec"]
+},
+WindowSize->{808, 868},
+WindowMargins->{{Automatic, 51}, {47, Automatic}},
+FrontEndVersion->"13.0 for Mac OS X ARM (64-bit) (February 4, 2022)",
+StyleDefinitions->"Default.nb",
+ExpressionUUID->"629d6347-85d0-454a-a22e-7efda308c56b"
+]
+(* End of Notebook Content *)
+
+(* Internal cache information *)
+(*CellTagsOutline
+CellTagsIndex->{}
+*)
+(*CellTagsIndex
+CellTagsIndex->{}
+*)
+(*NotebookFileOutline
+Notebook[{
+Cell[558, 20, 3539, 90, 157, "Input",ExpressionUUID->"7cc7e69d-33a4-4d06-b02c-6e7d39e33b4f"],
+Cell[4100, 112, 948, 25, 149, "Input",ExpressionUUID->"2c37bcdd-d678-4b6a-ac51-9b2deedda1ec"]
+}
+]
+*)
+

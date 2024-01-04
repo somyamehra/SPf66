@@ -1,0 +1,481 @@
+---
+title: "Spf66 supplementary fits"
+author: "Somya Mehra"
+date: "2023-11-03"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(tidyr)
+library(readr)
+library(parallel)
+library(lubridate)
+library(survival)
+library(ggplot2)
+library(cowplot)
+library(ggfortify)
+library(GGally)
+library(knitr)
+library(kableExtra)
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, message=FALSE, fig.align = 'center')
+
+library(extrafont)
+font_import() # takes a few minutes
+loadfonts(device="postscript")
+
+library(showtext)
+font_add(family = "Arial", regular = "Arial.ttf") ## here is the path to the font to add.
+showtext.auto()
+```
+
+## Data input
+
+```{r data_input}
+if (!dir.exists("Spf66_supplementary_fits")) dir.create("Spf66_supplementary_fits")
+if (!dir.exists("Spf66_supplementary_fits/Sporozoite_ratio")) dir.create("Spf66_supplementary_fits/Sporozoite_ratio")
+if (!dir.exists("Spf66_supplementary_fits/Age_stratified_FOI")) dir.create("Spf66_supplementary_fits/Age_stratified_FOI")
+
+RUN_ALL <- FALSE # flag whether or not to re-run fitting
+
+# source code for model fitting
+source("Model_calibration_code/clin_inf_likelihood_helper_func.R")
+source("Model_calibration_code/Metropolis_Hastings_fit.R")
+source("Model_calibration_code/simulate_clinical_recurrences.R")
+
+# pre-processed data from SPf66 cohort for model fitting
+patient_metadata <- read_rds("Spf66_data_cleaned/patient_metadata.rds")
+inf_states_by_VIN <- read_rds("Spf66_data_processed/discretised_infection_matrix.rds")
+SEASONALITY <- read_rds("Spf66_data_processed/seasonality_vector.rds") # inferred from Pf
+
+N_COHORT <- nrow(patient_metadata)
+keep_VIN <- as.character(patient_metadata$VIN)
+
+# results for baseline model fitting
+MCMC_results_main <- read_rds("Spf66_calibration/MCMC_results_main.rds")
+
+# discretisation into uniform windows 
+START_DATE <- as.Date("1993-10-01")
+END_DATE <- as.Date("1995-07-15")
+STUDY_DURATION <- as.numeric(difftime(END_DATE, START_DATE, unit="days"))
+TIME_STEP <- 10
+N_OBS <- STUDY_DURATION%/%10
+SHIFT_WINDOW <- 20 # estimate Pv FOI separately before and after this window
+YEAR_IN_TIMESTEP <- 365%/%TIME_STEP
+THRESHOLD_AGE <- 2*YEAR_IN_TIMESTEP # possible stratification in FORI above/below this age
+
+# fixed covariates
+PREL_BASELINE <- 0.4
+N_AGES <- patient_metadata[names(inf_states_by_VIN), "AGE"]*YEAR_IN_TIMESTEP # in units of TIME_STEP
+names(N_AGES) <- names(inf_states_by_VIN)
+MIN_AGE <- min(N_AGES)
+MAX_AGE <- max(N_AGES)
+
+# number of chains and iterations for MCMC (nested parallelisation over chains)
+N_CHAINS <- 4
+N_ITER <- 100000
+BURNIN_PROP <- 0.2
+N_CORES_PER_CHAIN <- 8
+
+# parameters for Metropolis-Hastings proposal
+LAMBDA_PROP_SD <- 0.02/365
+NU_PROP_SD <- 0.2
+ETA_PROP_SD <- 1/2000
+LOGIT_RHO_PROP_SD <- 0.05
+LOG_GAMMA_PROP_SD <- 0.05
+
+# hyperparameters for informative priors
+LOG_GAMMA_PRIOR_SD <- 0.6
+LOGIT_RHO_PRIOR_SD <- 0.7
+
+# parameters for posterior predictive data
+N_POSTERIOR_PREDICTIVE_DATASETS <- 2000
+PROPHYLAXIS_WINDOW <- 1
+BUNCHING_WINDOW <- 2
+
+# observed data for posterior predictive checking
+masking_matrix <- read_rds("Spf66_data_processed/discretised_masking_matrix.rds")
+observed_incidence_by_indiv <- read_rds("Spf66_data_processed/incidence_by_individual.rds") 
+
+# formatting
+POSTERIOR_COL <- "#cf7940"
+OBSERVED_COL <- "#4878b8"
+```
+
+## Misspecification of sporozoite fating probability
+
+The ratio of hypnozoites to immediately-developing forms in the baseline model is informed by *in vivo* estimates for the Chesson strain, which may not be representative for Southeast Asian strains. We thus perform a sensitivity analysis over the sporozoite ratio.
+
+```{r metropolis_hastings_prel}
+PREL_VALS <- c(0.1, 0.25, 0.6, 0.75, 0.9)
+prel_seeds <- c("11061897", "19121927", "22101900", "19121927", "03101924")
+
+MCMC_results_prel <- list()
+
+for (n in 1:length(PREL_VALS)) {
+  if (!file.exists(paste0("Spf66_supplementary_fits/Sporozoite_ratio/prel_sensitivity_analysis_", n, ".rds"))) {
+    
+  set.seed(prel_seeds[n])
+
+  # rescale LAMBDA2 to be the mean FOI in the second stage of the study
+  MCMC_results <- Metropolis_Hastings(inf_states_by_VIN, N_AGES, PREL_VALS[n], N_OBS, TIME_STEP,
+                                    SEASONALITY, SHIFT_WINDOW, THRESHOLD_AGE, 1,
+                                    N_CHAIN, N_ITER, N_CORES_PER_CHAIN,
+                                    LAMBDA_PROP_SD, NU_PROP_SD, ETA_PROP_SD,
+                                    LOGIT_RHO_PROP_SD, LOG_GAMMA_PROP_SD,
+                                    LOG_GAMMA_PRIOR_SD, LOGIT_RHO_PRIOR_SD) %>%
+      mutate(LAMBDA2=LAMBDA2*mean(tail(SEASONALITY, N_OBS)[(SHIFT_WINDOW+1):N_OBS]))
+  
+    write_rds(bind_cols(MCMC_results, PREL=PREL_VALS[n]), 
+              paste0("Spf66_supplementary_fits/Sporozoite_ratio/prel_sensitivity_analysis_", n, ".rds"))
+    
+    MCMC_results_prel[[n]] <- bind_cols(MCMC_results, PREL=PREL_VALS[n])
+  
+  } else {
+    
+    MCMC_results_prel[[n]] <- read_rds(paste0("Spf66_supplementary_fits/Sporozoite_ratio/prel_sensitivity_analysis_", n, ".rds"))
+    
+  }
+}
+
+MCMC_results_prel <- append(MCMC_results_prel, list(bind_cols(MCMC_results_main, PREL=PREL_BASELINE))) %>%
+  lapply(function(x) x %>% subset(ITER>BURNIN_PROP*max(x$ITER)))
+```
+
+```{r prel_plots, echo=FALSE, fig.width=22, fig.height=10}
+
+PARAMS <- c("LAMBDA1", "LAMBDA2", "NU", "ETA", "LOGIT_RHO", "LOG_GAMMA")
+
+Gelman_Rubin_diagnostic_prel <- lapply(MCMC_results_prel, function(x) {
+  GR <- calculate_Gelman_Rubin(x, max(x$ITER), BURNIN_PROP*max(x$ITER), max(as.numeric(x$CHAIN)), PARAMS)
+  return(data.frame(variable=factor(names(GR), levels=PARAMS), PREL=x[1, "PREL"],
+             R=paste0("R=", round(GR, 4), collapse=NULL)))}) %>% bind_rows %>%
+  mutate(PREL_label=factor(paste0("prel=", PREL), 
+                    levels=paste0("prel=", sort(c(PREL_BASELINE, PREL_VALS)))))
+
+
+MCMC_results_prel <- MCMC_results_prel %>% bind_rows %>%
+  mutate(PREL_label=factor(paste0("prel=", PREL), 
+                           levels=paste0("prel=", sort(c(PREL_BASELINE, PREL_VALS)))))
+
+marginal_posteriors_prel <- list()
+
+marginal_posteriors_prel[["LAMBDA1"]] <- ggplot() + 
+  geom_density(data=MCMC_results_prel, aes(x=LAMBDA1*365, group=CHAIN, color=as.character(CHAIN))) + 
+  geom_label(data=Gelman_Rubin_diagnostic_prel %>% subset(variable=="LAMBDA1"),
+             aes(x=Inf, y=Inf, label=R, hjust=1, vjust=1)) +
+  facet_wrap(vars(PREL_label), scale="free_y", dir="v", ncol=1) + 
+  xlab(bquote(lambda[1]~" (per year)")) + ylab("Density") + 
+  ggtitle("Mean FOI\n(before day 200)") + 
+  theme_light() + theme(legend.position = "none", 
+                        plot.title = element_text(face="bold", hjust=0.5), 
+                        strip.text = element_text(color="black", size=10))
+
+marginal_posteriors_prel[["LAMBDA2"]] <- ggplot() + 
+  geom_density(data=MCMC_results_prel, aes(x=LAMBDA2*365, group=CHAIN, color=as.character(CHAIN))) + 
+  geom_label(data=Gelman_Rubin_diagnostic_prel %>% subset(variable=="LAMBDA2"),
+             aes(x=Inf, y=Inf, label=R, hjust=1, vjust=1)) +
+  facet_wrap(vars(PREL_label), scale="free_y", dir="v", ncol=1) + 
+  xlab(bquote(lambda[2]~" (per year)")) + ylab("Density") + 
+  ggtitle("Mean FOI\n(after day 200)") + 
+  theme_light() + theme(legend.position = "none", 
+                        plot.title = element_text(face="bold", hjust=0.5), 
+                        strip.text = element_text(color="black", size=10))
+
+marginal_posteriors_prel[["ETA"]] <- ggplot() + 
+  geom_density(data=MCMC_results_prel, aes(x=ETA, group=CHAIN, color=as.character(CHAIN))) + 
+  geom_label(data=Gelman_Rubin_diagnostic_prel %>% subset(variable=="ETA"),
+             aes(x=Inf, y=Inf, label=R, hjust=1, vjust=1)) +
+  facet_wrap(vars(PREL_label), scale="free_y", dir="v", ncol=1) + 
+  xlab(bquote(eta~" (per day)")) + ylab("Density") + 
+  ggtitle("Activation rate") + 
+  theme_light() + theme(legend.position = "none", 
+                        plot.title = element_text(face="bold", hjust=0.5), 
+                        strip.text = element_text(color="black", size=10))
+
+
+marginal_posteriors_prel[["NU"]] <- ggplot() + 
+  geom_density(data=MCMC_results_prel, aes(x=NU*PREL, group=CHAIN, color=as.character(CHAIN))) + 
+  geom_label(data=Gelman_Rubin_diagnostic_prel %>% subset(variable=="NU"),
+             aes(x=Inf, y=Inf, label=R, hjust=1, vjust=1)) +
+  facet_wrap(vars(PREL_label), scale="free_y", dir="v", ncol=1) + 
+  xlab(bquote(nu ~ p[rel])) + ylab("Density") + 
+  ggtitle("Mean hypnozoite batch") + 
+  theme_light() + theme(legend.position = "none", 
+                        plot.title = element_text(face="bold", hjust=0.5), 
+                        strip.text = element_text(color="black", size=10))
+
+
+LOG_GAMMA_PRIOR <- data.frame(prior=rnorm(100000, sd=LOG_GAMMA_PRIOR_SD))
+LOGIT_RHO_PRIOR <- data.frame(prior=rnorm(100000, sd=LOGIT_RHO_PRIOR_SD))
+
+marginal_posteriors_prel[["LOG_GAMMA"]] <- ggplot() + 
+  geom_density(data=LOG_GAMMA_PRIOR, aes(x=prior), alpha=0.15, fill="black", lwd=0.1) +
+  geom_density(data=MCMC_results_prel, aes(x=LOG_GAMMA, group=CHAIN, color=as.character(CHAIN))) + 
+  geom_label(data=Gelman_Rubin_diagnostic_prel %>% subset(variable=="LOG_GAMMA"),
+             aes(x=Inf, y=Inf, label=R, hjust=1, vjust=1)) +
+  facet_wrap(vars(PREL_label), scale="free_y", dir="v", ncol=1) + 
+  xlab(bquote(log(gamma))) + ylab("Density") + 
+  ggtitle("Antidisease masking:\nshape parameter") + 
+  theme_light() + theme(legend.position = "none", 
+                        plot.title = element_text(face="bold", hjust=0.5), 
+                        strip.text = element_text(color="black", size=10))
+
+marginal_posteriors_prel[["LOGIT_RHO"]] <- ggplot() + 
+  geom_density(data=LOGIT_RHO_PRIOR, aes(x=prior), alpha=0.15, fill="black", lwd=0.1) +
+  geom_density(data=MCMC_results_prel, aes(x=LOGIT_RHO, group=CHAIN, color=as.character(CHAIN))) + 
+  geom_label(data=Gelman_Rubin_diagnostic_prel %>% subset(variable=="LOGIT_RHO"),
+             aes(x=Inf, y=Inf, label=R, hjust=1, vjust=1)) +
+  facet_wrap(vars(PREL_label), scale="free_y", dir="v", ncol=1) + 
+  xlab(bquote(logit(rho))) + ylab("Density") + 
+  ggtitle("Antidisease masking:\nshift parameter") + 
+  theme_light() + theme(legend.position = "none", 
+                        plot.title = element_text(face="bold", hjust=0.5), 
+                        strip.text = element_text(color="black", size=10))
+
+marginal_posteriors_prel[["YEAR1"]] <- ggplot() + 
+  geom_density(data=MCMC_results_prel, aes(x=LAMBDA1*(NU*PREL+(1-1/(1+NU*(1-PREL))))*365, group=CHAIN, color=as.character(CHAIN))) + 
+  facet_wrap(vars(PREL_label), scale="free_y", dir="v", ncol=1) + 
+  xlab(expression(paste(frac(paste(lambda[1], nu, "(1", " - ", p[rel], ")"),
+                             paste(1, "+", nu, "(1", " - ", p[rel], ")")), " + ", lambda[1], p[rel], nu, " (per year)"))) +
+  ylab("Density") + 
+  ggtitle(paste0("Yearly hypnozoite + prim\nburden (before day ", TIME_STEP*SHIFT_WINDOW, ")")) + 
+  theme_light() + theme(legend.position = "none", 
+                        plot.title = element_text(face="bold", hjust=0.5), 
+                        strip.text = element_text(color="black", size=10))
+
+marginal_posteriors_prel[["YEAR2"]] <- ggplot() + 
+  geom_density(data=MCMC_results_prel, aes(x=LAMBDA2*(NU*PREL+(1-1/(1+NU*(1-PREL))))*365, group=CHAIN, color=as.character(CHAIN))) + 
+  facet_wrap(vars(PREL_label), scale="free_y", dir="v", ncol=1) + 
+  xlab(expression(paste(frac(paste(lambda[2], nu, "(1", " - ", p[rel], ")"),
+                             paste(1, "+", nu, "(1", " - ", p[rel], ")")), " + ", lambda[2], p[rel], nu, " (per year)"))) +
+  ylab("Density") + 
+  ggtitle(paste0("Yearly hypnozoite + prim\nburden (after day ", TIME_STEP*SHIFT_WINDOW, ")")) + 
+  theme_light() + theme(legend.position = "none", 
+                        plot.title = element_text(face="bold", hjust=0.5), 
+                        strip.text = element_text(color="black", size=10))
+
+marginal_posteriors_prel_plot <- 
+  cowplot::plot_grid(plotlist=marginal_posteriors_prel, nrow=1, align="hv", axis="tblr")
+
+show(marginal_posteriors_prel_plot)
+
+pdf("Spf66_supplementary_fits/Sporozoite_ratio/prel_sensitivity_plot.pdf", width=22, height=9)
+show(marginal_posteriors_prel_plot)
+invisible(dev.off())
+```
+
+## Age stratification in the force of inoculation
+
+The baseline model is predicated on the assumption that there is no age-stratification in the force of inoculation between birth and age 15. The assumption of homogenoeity between ages 2 and 15 is informed by the absence of clear age strucuture in the incidence of symptomatic falciparum malaria in the SPf66 trial. However, it is plausible that behavioural differences mitigated the risk of exposure between birth and age 2. We thus re-fit the model, assuming that the force of inoculation between birth and age 2 is dampened by a fixed factor U.
+
+```{r metropolis_hastings_age_FOI}
+U_VALS <- c(0.1, 0.25, 0.5, 0.75)
+age_foi_seeds <- c("07101907", "15101999", "23071906", "27021931")
+
+MCMC_results_age_foi <- list()
+
+for (n in 1:length(U_VALS)) {
+  if (RUN_ALL || !file.exists(paste0("Spf66_supplementary_fits/Age_stratified_FOI/age_stratified_foi_", n, ".rds"))) {
+    
+  set.seed(age_foi_seeds[n])
+
+  # rescale LAMBDA2 to be the mean FOI in the second stage of the study
+  MCMC_results <- Metropolis_Hastings(inf_states_by_VIN, N_AGES, PREL_BASELINE, N_OBS, TIME_STEP,
+                                    SEASONALITY, SHIFT_WINDOW, THRESHOLD_AGE, U_VALS[n],
+                                    N_CHAIN, N_ITER, N_CORES_PER_CHAIN,
+                                    LAMBDA_PROP_SD, NU_PROP_SD, ETA_PROP_SD,
+                                    LOGIT_RHO_PROP_SD, LOG_GAMMA_PROP_SD,
+                                    LOG_GAMMA_PRIOR_SD, LOGIT_RHO_PRIOR_SD) %>%
+      mutate(LAMBDA2=LAMBDA2*mean(tail(SEASONALITY, N_OBS)[(SHIFT_WINDOW+1):N_OBS]))
+  
+    write_rds(bind_cols(MCMC_results, U=U_VALS[n]), 
+              paste0("Spf66_supplementary_fits/Age_stratified_FOI/age_stratified_foi_", n, ".rds"))
+    
+    MCMC_results_age_foi[[n]] <- bind_cols(MCMC_results, U=U_VALS[n])
+  
+  } else {
+    
+    MCMC_results_age_foi[[n]] <- read_rds(paste0("Spf66_supplementary_fits/Age_stratified_FOI/age_stratified_foi_", n, ".rds"))
+    
+  }
+}
+
+MCMC_results_age_foi <- append(MCMC_results_age_foi, list(bind_cols(MCMC_results_main, U=1))) %>%
+  lapply(function(x) x %>% subset(ITER>BURNIN_PROP*max(x$ITER)))
+
+```
+
+```{r age_stratified_foi_plots, echo=FALSE, fig.width=16, fig.height=8}
+Gelman_Rubin_diagnostic_age_foi <- lapply(MCMC_results_age_foi, function(x) {
+  GR <- calculate_Gelman_Rubin(x, max(x$ITER), BURNIN_PROP*max(x$ITER), max(as.numeric(x$CHAIN)), PARAMS)
+  return(data.frame(variable=factor(names(GR), levels=PARAMS), U=x[1, "U"],
+             R=paste0("R=", round(GR, 4), collapse=NULL)))}) %>% bind_rows %>%
+  mutate(FORI_label=factor(paste0("FOI under age of 2\ndampened by factor u=", U), 
+                           levels=paste0("FOI under age of 2\ndampened by factor u=", c(U_VALS, 1))))
+
+
+MCMC_results_age_foi_pooled <- MCMC_results_age_foi %>% bind_rows %>%
+  mutate(FORI_label=factor(paste0("FOI under age of 2\ndampened by factor u=", U), 
+                           levels=paste0("FOI under age of 2\ndampened by factor u=", c(U_VALS, 1))))
+
+marginal_posteriors_age_foi <- list()
+
+marginal_posteriors_age_foi[["LAMBDA1"]] <- ggplot() + 
+  geom_density(data=MCMC_results_age_foi_pooled, aes(x=LAMBDA1*365, group=CHAIN, color=as.character(CHAIN))) + 
+  geom_label(data=Gelman_Rubin_diagnostic_age_foi %>% subset(variable=="LAMBDA1"),
+             aes(x=Inf, y=Inf, label=R, hjust=1, vjust=1)) +
+  facet_wrap(vars(FORI_label), scale="free_y", dir="v", ncol=1) + 
+  xlab(bquote(lambda[1]~" (per year)")) + ylab("Density") + 
+  ggtitle("Mean FOI\n(before day 200)") + 
+  theme_light() + theme(legend.position = "none", 
+                        plot.title = element_text(face="bold", hjust=0.5), 
+                        strip.text = element_text(color="black", size=10))
+
+marginal_posteriors_age_foi[["LAMBDA2"]] <- ggplot() + 
+  geom_density(data=MCMC_results_age_foi_pooled, aes(x=LAMBDA2*365, group=CHAIN, color=as.character(CHAIN))) + 
+  geom_label(data=Gelman_Rubin_diagnostic_age_foi %>% subset(variable=="LAMBDA2"),
+             aes(x=Inf, y=Inf, label=R, hjust=1, vjust=1)) +
+  facet_wrap(vars(FORI_label), scale="free_y", dir="v", ncol=1) + 
+  xlab(bquote(lambda[2]~" (per year)")) + ylab("Density") + 
+  ggtitle("Mean FOI\n(after day 200)") + 
+  theme_light() + theme(legend.position = "none", 
+                        plot.title = element_text(face="bold", hjust=0.5), 
+                        strip.text = element_text(color="black", size=10))
+
+marginal_posteriors_age_foi[["ETA"]] <- ggplot() + 
+  geom_density(data=MCMC_results_age_foi_pooled, aes(x=ETA, group=CHAIN, color=as.character(CHAIN))) + 
+  geom_label(data=Gelman_Rubin_diagnostic_age_foi %>% subset(variable=="ETA"),
+             aes(x=Inf, y=Inf, label=R, hjust=1, vjust=1)) +
+  facet_wrap(vars(FORI_label), scale="free_y", dir="v", ncol=1) + 
+  xlab(bquote(eta~" (per day)")) + ylab("Density") + 
+  ggtitle("Activation rate") + 
+  theme_light() + theme(legend.position = "none", 
+                        plot.title = element_text(face="bold", hjust=0.5), 
+                        strip.text = element_text(color="black", size=10))
+
+
+marginal_posteriors_age_foi[["NU"]] <- ggplot() + 
+  geom_density(data=MCMC_results_age_foi_pooled, aes(x=NU*PREL_BASELINE, group=CHAIN, color=as.character(CHAIN))) + 
+  geom_label(data=Gelman_Rubin_diagnostic_age_foi %>% subset(variable=="NU"),
+             aes(x=Inf, y=Inf, label=R, hjust=1, vjust=1)) +
+  facet_wrap(vars(FORI_label), scale="free_y", dir="v", ncol=1) + 
+  xlab(bquote(nu ~ p[rel])) + ylab("Density") + 
+  ggtitle("Mean hypnozoite batch") + 
+  theme_light() + theme(legend.position = "none", 
+                        plot.title = element_text(face="bold", hjust=0.5), 
+                        strip.text = element_text(color="black", size=10))
+
+
+marginal_posteriors_age_foi[["LOG_GAMMA"]] <- ggplot() + 
+  geom_density(data=LOG_GAMMA_PRIOR, aes(x=prior), alpha=0.15, fill="black", lwd=0.1) +
+  geom_density(data=MCMC_results_age_foi_pooled, aes(x=LOG_GAMMA, group=CHAIN, color=as.character(CHAIN))) + 
+  geom_label(data=Gelman_Rubin_diagnostic_age_foi %>% subset(variable=="LOG_GAMMA"),
+             aes(x=Inf, y=Inf, label=R, hjust=1, vjust=1)) +
+  facet_wrap(vars(FORI_label), scale="free_y", dir="v", ncol=1) + 
+  xlab(bquote(log(gamma))) + ylab("Density") + 
+  ggtitle("Antidisease masking:\nshape parameter") + 
+  theme_light() + theme(legend.position = "none", 
+                        plot.title = element_text(face="bold", hjust=0.5), 
+                        strip.text = element_text(color="black", size=10))
+
+marginal_posteriors_age_foi[["LOGIT_RHO"]] <- ggplot() + 
+  geom_density(data=LOGIT_RHO_PRIOR, aes(x=prior), alpha=0.15, fill="black", lwd=0.1) +
+  geom_density(data=MCMC_results_age_foi_pooled, aes(x=LOGIT_RHO, group=CHAIN, color=as.character(CHAIN))) + 
+  geom_label(data=Gelman_Rubin_diagnostic_age_foi %>% subset(variable=="LOGIT_RHO"),
+             aes(x=Inf, y=Inf, label=R, hjust=1, vjust=1)) +
+  facet_wrap(vars(FORI_label), scale="free_y", dir="v", ncol=1) + 
+  xlab(bquote(logit(rho))) + ylab("Density") + 
+  ggtitle("Antidisease masking:\nshift parameter") + 
+  theme_light() + theme(legend.position = "none", 
+                        plot.title = element_text(face="bold", hjust=0.5), 
+                        strip.text = element_text(color="black", size=10))
+
+marginal_posteriors_age_foi_plots <- 
+  cowplot::plot_grid(plotlist=marginal_posteriors_age_foi, nrow=1, align="hv", axis="tblr")
+
+show(marginal_posteriors_age_foi_plots)
+
+```
+We also assess whether the assumed model of age-stratification in the force of inoculation can better recaptiulate non-monotonic age structure in the incidence of symptomatic vivax malaria.
+
+```{r simulate_data_age_foi}
+posterior_predictive_age_foi <- lapply(MCMC_results_age_foi, function(x) {
+  posterior_draws <- x[sample(1:nrow(x), N_POSTERIOR_PREDICTIVE_DATASETS),]
+    
+  posterior_predictive_cohorts <- 
+    lapply(1:N_POSTERIOR_PREDICTIVE_DATASETS, function(i) {
+      simulate_dataset(time_dependent_fori(posterior_draws[i, "LAMBDA1"], 
+                                           posterior_draws[i, "LAMBDA2"]/mean(tail(SEASONALITY, N_OBS)[(SHIFT_WINDOW+1):N_OBS]), 
+                                           SHIFT_WINDOW, SEASONALITY),
+                       TIME_STEP, N_AGES, N_OBS, posterior_draws[i, "NU"], 1,
+                       posterior_draws[i, "ETA"], PREL_BASELINE, PROPHYLAXIS_WINDOW, BUNCHING_WINDOW,
+                       calculate_pclin(N_AGES, posterior_draws[i, "LOGIT_RHO"], 
+                                       posterior_draws[i, "LOG_GAMMA"], MIN_AGE, MAX_AGE),
+                       masking_matrix, posterior_draws[i, "U"], MIN_AGE)})
+  
+  return(list(sim_data=posterior_predictive_cohorts, U=posterior_draws[1, "U"]))})
+  
+```
+
+We focus on the incidence rate, computed as the quotient of the total number of symptomatic vivax episodes and the cumulative duration of clinical follow-up (adjusted for left- and right-censoring, documented absences from the camp and post-exposure prophylaxis) for each age group.
+
+```{r age_stratified_incidence_rate}
+simulated_incidence_rate <- lapply(posterior_predictive_age_foi, function(sim_cohorts) {
+  sapply(sim_cohorts[["sim_data"]], function(x) {
+    split(x, patient_metadata[rownames(x), "AGE"]) %>% 
+      sapply(function(y) sum(y==1, na.rm = TRUE)/sum(!is.na(y))*365%/%TIME_STEP)}) %>% 
+    apply(1, function(x) quantile(x, c(0.025, 0.5, 0.975))) %>% 
+    t %>% as.data.frame %>% 
+    mutate(AGE=as.numeric(rownames(.)), U=sim_cohorts[["U"]],
+           FORI_label=factor(paste0("FOI under age of 2\ndampened by factor u=", U), 
+                           levels=paste0("FOI under age of 2\ndampened by factor u=", c(U_VALS, 1))),
+           source="Posterior predicted")}) %>%
+  bind_rows()
+
+N_BOOTSTRAP_REPLICATES <- 2000
+observed_incidence_bootstrap <- lapply(1:N_BOOTSTRAP_REPLICATES, function(i) {
+  observed_incidence_by_indiv[sample(1:N_COHORT, N_COHORT, replace=T),]})
+
+observed_incidence_rate <- lapply(observed_incidence_bootstrap, function(x) {
+  x %>% group_by(AGE) %>% summarise(mean_incidence=sum(N_Pv)/sum(Followup_Pv))}) %>% 
+  bind_rows(.id="iter") %>%
+  group_by(AGE) %>% 
+  summarise(`2.5%`=quantile(mean_incidence, 0.025),
+            `50%`=quantile(mean_incidence, 0.5),
+            `97.5%`=quantile(mean_incidence, 0.975)) %>%
+  mutate(source="Observed")
+
+```
+
+```{r age_structure_incidence_rate_plot, echo=FALSE, fig.width=16, fig.height=5}
+incidence_rate_plots <- ggplot() +
+  geom_errorbar(data=simulated_incidence_rate, aes(x=AGE, ymin=`2.5%`, ymax=`97.5%`, color=source), width=0.4) +
+  geom_point(data=simulated_incidence_rate, aes(x=AGE, y=`50%`, color=source)) +
+  geom_smooth(data=simulated_incidence_rate, aes(x=AGE, y=`50%`, color=source), se = FALSE, lwd=0.5) +
+  geom_errorbar(data=observed_incidence_rate, aes(x=AGE+0.25, ymin=`2.5%`, ymax=`97.5%`, color=source), width=0.4) +
+  geom_point(data=observed_incidence_rate, aes(x=AGE+0.25, y=`50%`, color=source)) +
+  geom_smooth(data=observed_incidence_rate, aes(x=AGE, y=`50%`, color=source), se = FALSE, lwd=0.5) +
+  facet_grid(cols=vars(FORI_label)) +
+  xlab("Age (years)") + ylab("Incidence rate\n(symptomatic vivax episodes per year)") + 
+  ggtitle("Aggregated incidence rate of symptomatic vivax malaria") +
+  scale_x_continuous(breaks=2:15) +
+  scale_color_manual(values=c(OBSERVED_COL, POSTERIOR_COL), name=NULL) +
+  theme_bw() + theme(plot.title = element_text(face="bold", hjust=0.5),
+                     strip.text = element_text(size=11),
+                     strip.background = element_rect(fill="#f0f0f0"),
+                     legend.position = "bottom")
+
+show(incidence_rate_plots)
+
+pdf("Spf66_supplementary_fits/Age_stratified_FOI/age_stratified_foi_plot.pdf", width=16, height=10)
+show(cowplot::plot_grid(marginal_posteriors_age_foi_plots, incidence_rate_plots, ncol=1,  
+                        scale=0.975, labels=c("(A)", "(B)"), rel_heights = c(1.75, 1)))
+invisible(dev.off())
+
+
+```
+
