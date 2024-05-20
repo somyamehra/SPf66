@@ -7,3 +7,9 @@ The analysis can be reproduced by running the R Markdown files as follows:
 * *Spf66_supplementary_fits.Rmd*: this performs supplementary model fits to interrogate the consequences of certain forms of model misspecification, as addressed in the appendix.
 
 A minimum analysis dataset, including patient metadata and a summary of malaria consultation records, can be found in the directory *Spf66_data_cleaned*.
+
+The following packages are required to run the RMarkdown files:
+* *Handling data*: dplyr, tidyr, readr, lubridate
+* *Model fitting*: Rcpp, RcppArmadillo, parallel
+* *Statistical tests*: survival, MatchIt, PMCMRplus
+* *Visualisation*: ggplot2, cowplot, ggfortify, GGally, knitr, kableExtra
