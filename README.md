@@ -9,7 +9,7 @@ The analysis can be reproduced by running the R Markdown files as follows:
 A minimum analysis dataset, including patient metadata and a summary of malaria consultation records, can be found in the directory *Spf66_data_cleaned*.
 
 The following packages are required to run the RMarkdown files:
-* *Handling data*: dplyr, tidyr, readr, lubridate
+* *Handling data*: dplyr, tidyr, readr, lubridate, IRanges
 * *Model fitting*: Rcpp, RcppArmadillo, parallel
 * *Statistical tests*: survival, MatchIt, PMCMRplus
 * *Visualisation*: ggplot2, cowplot, ggfortify, GGally, knitr, kableExtra
