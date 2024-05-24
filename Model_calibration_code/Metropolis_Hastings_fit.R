@@ -22,7 +22,8 @@ Metropolis_Hastings <- function(inf_states_by_VIN, N_AGES, PREL, N_OBS, TIME_STE
   S_minus <- S_vectors[["S_minus"]]
   
   # https://stackoverflow.com/questions/8413188/can-i-nest-parallelparlapply
-  # parallelise over chains 
+  # parallelise over chains
+  # this works on Mac but a different workaround might be needed for Windoes 
   cl <- makeCluster(N_CHAINS)
   
   # export objects from local function environment

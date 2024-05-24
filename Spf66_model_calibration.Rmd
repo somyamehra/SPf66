@@ -401,7 +401,7 @@ We calculate the incidence rate, stratified by age at enrolment, as the quotient
 ```{r age_structure_incidence_rate}
 incidence_rate <- list()
 
-incidence_rate[["Posterior predicted"]] <- sapply(posterior_predictive_cohorts, function(x) {
+incidence_rate[["Posterior predictive"]] <- sapply(posterior_predictive_cohorts, function(x) {
   split(x, patient_metadata[rownames(x), "AGE"]) %>% 
     sapply(function(y) sum(y==1, na.rm = TRUE)/sum(!is.na(y))*365%/%TIME_STEP)}) %>% 
   apply(1, function(x) quantile(x, c(0.025, 0.5, 0.975))) %>% 
@@ -467,7 +467,7 @@ observed_incidence_by_indiv <- merge(observed_incidence_by_indiv, age_counts)
 
 indiv_incidence_plot <- ggplot() +
   geom_line(data=indiv_incidence_simulated,
-            aes(x=median, y=index, group=AGE, color="Posterior predicted"), lwd=0.7) +
+            aes(x=median, y=index, group=AGE, color="Posterior predictive"), lwd=0.7) +
   geom_ribbon(data=indiv_incidence_simulated,
               aes(xmin=LCI, xmax=UCI, y=index, group=AGE), fill=POSTERIOR_COL, alpha=0.25) +
   geom_line(data=observed_incidence_by_indiv,
@@ -521,9 +521,9 @@ observed_incidence_by_window <- observed_incidence_by_window %>%
 
 incidence_by_window_plot <- ggplot() + 
   geom_point(data=posterior_predictive_incidence_by_window,  
-             aes(x=Date, y=`50%`/12, col="Posterior predicted"), pch=4, size=2) + 
+             aes(x=Date, y=`50%`/12, col="Posterior predictive"), pch=4, size=2) + 
   geom_errorbar(data=posterior_predictive_incidence_by_window, 
-                aes(x=Date, ymin=`2.5%`/12, ymax=`97.5%`/12, col="Posterior predicted"), size=0.3) + 
+                aes(x=Date, ymin=`2.5%`/12, ymax=`97.5%`/12, col="Posterior predictive"), size=0.3) + 
   geom_point(data=observed_incidence_by_window, aes(x=Date, y=incidence/12, col="Observed"), size=2, pch=15) +
   geom_line(data=observed_incidence_by_window, aes(x=Date, y=incidence/12, col="Observed"), size=0.3) + 
   coord_cartesian(ylim=c(0, NA)) +

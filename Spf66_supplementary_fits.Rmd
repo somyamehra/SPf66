@@ -433,7 +433,7 @@ simulated_incidence_rate <- lapply(posterior_predictive_age_foi, function(sim_co
     mutate(AGE=as.numeric(rownames(.)), U=sim_cohorts[["U"]],
            FORI_label=factor(paste0("FOI under age of 2\ndampened by factor u=", U), 
                            levels=paste0("FOI under age of 2\ndampened by factor u=", c(U_VALS, 1))),
-           source="Posterior predicted")}) %>%
+           source="Posterior predictive")}) %>%
   bind_rows()
 
 N_BOOTSTRAP_REPLICATES <- 2000

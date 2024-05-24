@@ -1,0 +1,836 @@
+---
+title: "Simulation studies"
+author: "Somya Mehra"
+date: "2023-12-12"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(tidyr)
+library(readr)
+library(parallel)
+library(ggplot2)
+library(cowplot)
+library(ggfortify)
+library(GGally)
+library(knitr)
+library(kableExtra)
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, message=FALSE, fig.align = 'center')
+
+library(extrafont)
+font_import() # takes a few minutes
+loadfonts(device="postscript")
+
+library(showtext)
+font_add(family = "Arial", regular = "Arial.ttf") ## here is the path to the font to add.
+showtext.auto()
+```
+
+## Data input
+
+```{r data_input}
+if (!dir.exists("Simulation_studies")) dir.create("Simulation_studies")
+if (!dir.exists("Simulation_studies/Batch_size")) dir.create("Simulation_studies/Batch_size")
+if (!dir.exists("Simulation_studies/Pop_heterogeneity")) dir.create("Simulation_studies/Pop_heterogeneity")
+
+RUN_ALL <- FALSE # flag whether or not to re-run fitting
+
+# source code for model fitting
+source("Model_calibration_code/simulate_clinical_recurrences.R")
+source("Model_calibration_code/clin_inf_likelihood_helper_func.R")
+source("Model_calibration_code/Metropolis_Hastings_fit.R")
+
+# parameters under which data are simulated
+PARAM_TRUTH_HET <- expand.grid(LAMBDA_MEAN_TRUTH=c(0.25/365, 0.5/365),
+                               NU_TRUTH=6, 
+                               ETA_TRUTH=c(1/400, 1/200, 1/100),
+                               KAPPA_TRUTH=c(0.245, 1.15, 9.1, Inf))
+
+PARAM_TRUTH_HET_SUPP <- expand.grid(LAMBDA_MEAN_TRUTH=c(0.25/365, 0.5/365),
+                                    NU_TRUTH=6, 
+                                    ETA_TRUTH=c(1/400, 1/200, 1/100),
+                                    KAPPA_TRUTH=2.485)
+
+PARAM_TRUTH_HET <- rbind(PARAM_TRUTH_HET, PARAM_TRUTH_HET_SUPP)
+
+PARAM_TRUTH_BATCH <- expand.grid(LAMBDA_MEAN_TRUTH=c(0.5/365),
+                                 NU_TRUTH=c(4, 6, 8), 
+                                 ETA_TRUTH=c(1/400, 1/200, 1/100),
+                                 R_TRUTH=c(0.25, 0.5, 1, 2))
+
+PREL <- 0.4
+
+N_OBS <- 65
+TIME_STEP <- 10
+PROPHYLAXIS_WINDOW <- 1
+BUNCHING_WINDOW <- 2
+
+N_AGES <- rep((2:15)*(365%/%TIME_STEP), each=80)
+PCLIN <- rep(1, length(N_AGES))
+SEASONALITY <- rep(1, N_OBS+max(N_AGES))
+
+MAX_INF <- 12
+
+
+# parameters for Metropolis-Hastings proposal distribution
+LAMBDA_PROP_SD <- 0.02/365
+NU_PROP_SD <- 0.2
+ETA_PROP_SD <- 1/2000
+
+# MCMC parametrers
+N_CHAINS <- 4
+N_ITER <- 32000
+N_CORES_PER_CHAIN <- 3
+BURNIN_PROP <- 0.5
+```
+
+## Population heterogeneity in force of inoculation
+
+We simulate data under a Gamma-distributed force of inoculation to accommodate population heterogeneity; but perform inference under a model which assumes a homogeneous force of inoculation.
+
+```{r sim_pop_het}
+simulate_cohort_het <- function(LAMBDA_MEAN, KAPPA, SEASONALITY, TIME_STEP, N_AGES, N_OBS, NU, R, ETA, PREL, U, SHIFT_AGE) {
+  t(sapply(N_AGES, function(N_AGE) {
+    LAMBDA_SCALE <- ifelse(is.infinite(KAPPA), LAMBDA_MEAN, rgamma(1, shape=KAPPA, scale=LAMBDA_MEAN/KAPPA))
+    LAMBDA <- LAMBDA_SCALE*SEASONALITY
+    LAMBDA_ADJUSTED <- c(head(LAMBDA, -(N_OBS+N_AGE-SHIFT_AGE))*U, tail(LAMBDA, N_OBS+N_AGE-SHIFT_AGE))
+    inf <- simulate_patient(LAMBDA_ADJUSTED, TIME_STEP, N_AGE, N_OBS, NU, R, ETA, PREL) - N_AGE*TIME_STEP
+    inf <- (inf[inf>=0 & inf<=N_OBS*TIME_STEP])%/%TIME_STEP+1
+    y <- rep(0, N_OBS); y[inf] <- 1; return(y)}))
+}
+
+simulate_dataset_het <- function(LAMBDA_MEAN, KAPPA, SEASONALITY, TIME_STEP, N_AGES, N_OBS, NU, R, ETA, PREL, 
+                                 PROPHYLAXIS_WINDOW, BUNCHING_WINDOW, PCLIN, MASKING_MATRIX, U, SHIFT_AGE) {
+  
+  all_inf <- simulate_cohort_het(LAMBDA_MEAN, KAPPA, SEASONALITY, TIME_STEP, N_AGES, N_OBS, NU, R, ETA, PREL, U, SHIFT_AGE)
+  inf_matrix <- simulate_masking(all_inf, PCLIN, PROPHYLAXIS_WINDOW, BUNCHING_WINDOW, MASKING_MATRIX)
+  
+  return(inf_matrix)
+}
+```
+
+```{r pop_het}
+set.seed("08042024")
+
+pop_het <- list()
+
+for (k in 1:nrow(PARAM_TRUTH_HET)) {
+  if (RUN_ALL | !file.exists(paste0("Simulation_studies/Pop_heterogeneity/pop_het_", k, ".rds"))) {
+    
+    # simulate recurrences using direct stochastic simulation
+    inf_matrix <- simulate_cohort_het(PARAM_TRUTH_HET[k, "LAMBDA_MEAN_TRUTH"],
+                                      PARAM_TRUTH_HET[k, "KAPPA_TRUTH"], 
+                                      SEASONALITY, TIME_STEP, N_AGES, N_OBS, 
+                                      PARAM_TRUTH_HET[k, "NU_TRUTH"], 1,
+                                      PARAM_TRUTH_HET[k, "ETA_TRUTH"], PREL, U=1, SHIFT_AGE=1)
+    
+    # retain up to MAX_INF infections per individual
+    for (i in 1:nrow(inf_matrix)) {
+      y <- cumsum(inf_matrix[i,])
+      inf_matrix[i, y>MAX_INF] <- NA
+    }
+    
+    # generate a ternary infection matrix adjusted for post-exposure prophylaxis
+    ternary_matrix <- matrix("M", nrow=nrow(inf_matrix), ncol=ncol(inf_matrix))
+    ternary_matrix[inf_matrix==0] <- "N"
+    ternary_matrix[inf_matrix==1] <- "C"
+  
+    for (i in 1:nrow(inf_matrix)) {
+      inf_times <- which(inf_matrix[i,]==1)
+      masked_times <- which(is.na(inf_matrix[i,]))
+    
+      if (PROPHYLAXIS_WINDOW>0) {
+        for (j in 1:ncol(inf_matrix)) {
+          if (!is.na(inf_matrix[i, j]) & inf_matrix[i, j]==1) {
+            # period of complete prophylactic protection
+            inf_matrix[i,  subset(j+(1:PROPHYLAXIS_WINDOW), j+(1:PROPHYLAXIS_WINDOW)<=ncol(inf_matrix))] <- NA
+            ternary_matrix[i,  subset(j+(1:PROPHYLAXIS_WINDOW), j+(1:PROPHYLAXIS_WINDOW)<=ncol(inf_matrix))] <- "M"
+          
+            # prophylactic bunching period
+            check <- any(inf_matrix[i,  subset(j+PROPHYLAXIS_WINDOW+(1:BUNCHING_WINDOW), 
+                                             j+PROPHYLAXIS_WINDOW+(1:BUNCHING_WINDOW)<=ncol(inf_matrix))]==1)
+            check <- ifelse(is.na(check), FALSE, check)
+            if (check) {
+              inf_matrix[i,  subset(j+PROPHYLAXIS_WINDOW+BUNCHING_WINDOW, 
+                                    j+PROPHYLAXIS_WINDOW+BUNCHING_WINDOW<=ncol(inf_matrix))] <- 1
+              inf_matrix[i,  subset(j+PROPHYLAXIS_WINDOW+(1:(BUNCHING_WINDOW-1)), 
+                                    j+PROPHYLAXIS_WINDOW+(1:(BUNCHING_WINDOW-1))<=ncol(inf_matrix))] <- 0
+              ternary_matrix[i,  subset(j+PROPHYLAXIS_WINDOW+(1:BUNCHING_WINDOW), 
+                                        j+PROPHYLAXIS_WINDOW+(1:BUNCHING_WINDOW)<=ncol(inf_matrix))] <- "B"
+            }
+          }
+        }
+      }
+      ternary_matrix[i, masked_times] <- "M" 
+    }
+  
+    # generate S vectors
+    S_vectors <- generate_S_vectors(split(ternary_matrix, 1:nrow(ternary_matrix)))
+    
+    # https://stackoverflow.com/questions/8413188/can-i-nest-parallelparlapply
+    # parallelise over chains 
+    cl <- makeCluster(N_CHAINS)
+  
+    # export objects from local function environment
+    clusterExport(cl, c('S_vectors', 'N_AGES', 'PREL', 'N_OBS', 'TIME_STEP',
+                        'SEASONALITY', 'N_ITER', 'N_CORES_PER_CHAIN',
+                        'LAMBDA_PROP_SD', 'NU_PROP_SD', 'ETA_PROP_SD'),
+                  envir=environment())
+  
+    MCMC_results <- parLapply(cl, 1:length(cl), function(CHAIN) {
+    
+      source("Model_calibration_code/clin_inf_likelihood_helper_func.R")
+    
+      param_vals <- data.frame(matrix(ncol = 6, nrow = N_ITER))
+      colnames(param_vals) <- c("CHAIN", "ITER", "LAMBDA", "NU", "ETA", "LOG_LIK")
+      param_vals[, "CHAIN"] <- CHAIN
+      param_vals[, "ITER"] <- 1:N_ITER
+    
+      # initialise parameter values
+      param_vals[1, "LAMBDA"] <-  runif(1, 0.1/365, 1/365)
+      param_vals[1, "NU"] <-  runif(1, 0.5, 8)
+      param_vals[1, "ETA"] <- runif(1, 1/500, 1/50)
+      param_vals[1, "LOG_LIK"] <- 
+        cohort_likelihood(S_vectors[["S_plus"]], S_vectors[["S_minus"]], N_AGES, 
+                          1, SEASONALITY*param_vals[1, "LAMBDA"],
+                          param_vals[1, "ETA"], param_vals[1, "NU"], PREL, 
+                          N_OBS, TIME_STEP, 1, 1, N_CORES_PER_CHAIN)
+    
+      for (i in 2:N_ITER) {
+        # sample parameter values from proposal distrbution
+        lambda_prop <- rnorm(1, param_vals[i-1, "LAMBDA"], LAMBDA_PROP_SD)
+        if (lambda_prop<0) lambda_prop <- param_vals[i-1, "LAMBDA"]
+      
+        nu_prop <- rnorm(1, param_vals[i-1, "NU"], NU_PROP_SD)
+        if (nu_prop<0) nu_prop <- param_vals[i-1, "NU"]
+      
+        eta_prop <- rnorm(1, param_vals[i-1, "ETA"], ETA_PROP_SD)
+        if (eta_prop<0) eta_prop <- param_vals[i-1, "ETA"]
+      
+        # calculate likelihood ratio
+        likelihood_prop <- 
+          cohort_likelihood(S_vectors[["S_plus"]], S_vectors[["S_minus"]], N_AGES, 
+                            1, SEASONALITY*lambda_prop,
+                            eta_prop, nu_prop, PREL, N_OBS, TIME_STEP, 
+                            1, 1, N_CORES_PER_CHAIN)
+      
+        likelihood_ratio <- exp(likelihood_prop-param_vals[i-1, "LOG_LIK"])
+      
+        # accept or reject
+        if (runif(1)<=likelihood_ratio) {
+          param_vals[i, "LAMBDA"] <- lambda_prop
+          param_vals[i, "NU"] <- nu_prop
+          param_vals[i, "ETA"] <- eta_prop
+          param_vals[i, "LOG_LIK"] <- likelihood_prop
+        } else {
+          param_vals[i, 3:6] <- param_vals[i-1, 3:6]
+        }
+      }
+    
+      return(param_vals)
+    
+    })
+  
+    collated_results <- list(MCMC_results=bind_rows(MCMC_results),
+                             LAMBDA_MEAN_TRUTH=PARAM_TRUTH_HET[k, "LAMBDA_MEAN_TRUTH"], 
+                             NU_TRUTH=PARAM_TRUTH_HET[k, "NU_TRUTH"],
+                             KAPPA_TRUTH=PARAM_TRUTH_HET[k, "KAPPA_TRUTH"], 
+                             ETA_TRUTH=PARAM_TRUTH_HET[k, "ETA_TRUTH"], 
+                             ternary_matrix=ternary_matrix)
+  
+    write_rds(collated_results, 
+              paste0("Simulation_studies/Pop_heterogeneity/pop_het_", k, ".rds"),
+              compress="gz")
+  } else {
+    collated_results <- read_rds(paste0("Simulation_studies/Pop_heterogeneity/pop_het_", k, ".rds"))
+  }
+  
+  pop_het[[k]] <- collated_results
+}
+
+```
+
+```{r pop_het_plot, echo=FALSE, fig.width=14, fig.height=22}
+proportion_bites_top_20 <- function(k) {
+  #if (is.infinite(k)) return("homogeneous")
+  p <- 0.2+dgamma(qgamma(0.8, shape=k, scale=1/k), shape=k+1, scale=1/k)/k
+  p <- paste0(round(p*100, 1), "% bites in top 20% hosts")
+  p[is.infinite(k)] <- "20% bites in top 20% hosts\ni.e.homogeneous"
+  return(p)
+}
+
+MCMC_results_reparam <- lapply(pop_het, function(sim_run) {
+  sim_run[["MCMC_results"]] %>%
+    subset(ITER>BURNIN_PROP*N_ITER) %>%
+    transmute(CHAIN=CHAIN, ITER=ITER, ETA=ETA, LAMBDA=LAMBDA, NU=NU) %>%
+    reshape2::melt(id=c("CHAIN", "ITER"))})
+
+param_cols <- c("ETA", "LAMBDA", "NU")
+
+Gelman_Rubin <- lapply(pop_het, function(sim_run) {
+  calculate_Gelman_Rubin(sim_run[["MCMC_results"]], N_ITER, N_ITER*BURNIN_PROP, 
+                         N_CHAINS, param_cols)
+})
+
+MCMC_truth_vals <- sapply(pop_het, function(sim_run) {
+  c(ETA=sim_run[["ETA_TRUTH"]], LAMBDA=sim_run[["LAMBDA_MEAN_TRUTH"]], 
+    NU=sim_run[["NU_TRUTH"]], KAPPA=sim_run[["KAPPA_TRUTH"]])}) %>% 
+  t %>% as.data.frame %>% mutate(param=1:nrow(.)) %>%
+  mutate(kappa=proportion_bites_top_20(KAPPA))
+
+param_groups <- split(MCMC_truth_vals, f=~ETA+LAMBDA+NU) %>% lapply(function(x) x$param)
+
+marginal_posterior_plots <- function(param_set) {
+  
+  marginal_posteriors <- 
+    lapply(param_set, function(i) 
+      bind_cols(MCMC_results_reparam[[i]], kappa=proportion_bites_top_20(MCMC_truth_vals[i,"KAPPA"]))) %>% 
+    bind_rows %>% split(f=.$variable)
+  
+  n_inf <- lapply(param_set, function(i) {
+    data.frame(n=rowSums(pop_het[[i]][["ternary_matrix"]]=="C") + 
+                        rowSums(pop_het[[i]][["ternary_matrix"]]=="B")/2, 
+               kappa=proportion_bites_top_20(MCMC_truth_vals[i,"KAPPA"]))}) %>% bind_rows()
+  
+  lambda <- lapply(param_set, function(i) {
+    data.frame(lambda=seq(0, 1.5, 0.005)/365, 
+               density=dgamma(seq(0, 1.5, 0.005)/365, shape=MCMC_truth_vals[i,"KAPPA"], 
+                              scale=MCMC_truth_vals[i,"LAMBDA"]/MCMC_truth_vals[i,"KAPPA"]), 
+               kappa=proportion_bites_top_20(MCMC_truth_vals[i,"KAPPA"]))}) %>% bind_rows()
+  
+  marginal_plots <- list()
+  
+  marginal_plots[["lambda"]] <- ggplot(lambda) + 
+    geom_vline(data=MCMC_truth_vals[param_set,],aes(xintercept=LAMBDA)) + 
+    geom_line(aes(x=lambda, y=density)) + 
+    facet_wrap(vars(kappa), dir="v", ncol=1, scale="free_y") + 
+    scale_x_continuous(breaks=seq(0, 4, 1)/365, labels=seq(0, 4, 1)) +
+    xlab(bquote(lambda ~ "(per year)")) + ylab("Density") + 
+    ggtitle("Force of inoculation") +
+    theme_light() + theme(legend.position = "none",
+                          plot.subtitle = element_text(hjust=0.5),
+                          plot.title = element_text(hjust=0.5),
+                          strip.text = element_text(color="black", size=10))
+  
+  marginal_plots[["n_inf"]] <- ggplot(n_inf) + 
+    geom_bar(aes(x=n, fill=(n<=MAX_INF))) + 
+    facet_wrap(vars(kappa), scale="free_y", dir="v", ncol=1) + 
+    xlab("No. recurrences") + ylab("No. individuals") + 
+    ggtitle("Simulated recurrences") +
+    theme_light() + theme(legend.position = "none",
+                          plot.title = element_text(hjust=0.5),
+                          strip.text = element_text(color="black", size=10))
+  
+  marginal_plots[["ETA"]] <- ggplot() + 
+    geom_density(data=marginal_posteriors[["ETA"]], 
+                 aes(x=value, color=as.character(CHAIN))) + 
+    geom_vline(data=MCMC_truth_vals[param_set,], aes(xintercept=ETA)) + 
+    coord_cartesian(xlim=c(0, NA)) +
+    facet_wrap(vars(kappa), scale="free_y", dir="v", ncol=1) + 
+    xlab(bquote(eta ~ "(per day)")) + ylab("Density") + 
+    ggtitle(bquote("Activation rate" ~ eta)) + 
+    theme_light() + theme(legend.position = "none",
+                          plot.title = element_text(face="bold", hjust=0.5),
+                          strip.text = element_text(color="black", size=10))
+  
+  marginal_plots[["LAMBDA"]] <- ggplot() + 
+    geom_density(data=marginal_posteriors[["LAMBDA"]], 
+                 aes(x=value*365, color=as.character(CHAIN))) + 
+    geom_vline(data=MCMC_truth_vals[param_set,],aes(xintercept=LAMBDA*365)) + 
+    coord_cartesian(xlim=c(0, NA)) +
+    facet_wrap(vars(kappa), scale="free_y", dir="v", ncol=1) + 
+    xlab(bquote(bar(lambda) ~ "(per year)")) + ylab("Density") + 
+    ggtitle(bquote("Mean force of\ninoculation" ~ bar(lambda))) + 
+    theme_light() + theme(legend.position = "none", 
+                          plot.title = element_text(face="bold", hjust=0.5),
+                          strip.text = element_text(color="black", size=10))
+  
+  marginal_plots[["NU"]] <- ggplot() + 
+    geom_density(data=marginal_posteriors[["NU"]],
+                 aes(x=value, color=as.character(CHAIN))) + 
+    geom_vline(data=MCMC_truth_vals[param_set,], aes(xintercept= NU)) + 
+    coord_cartesian(xlim=c(0, NA)) +
+    facet_wrap(vars(kappa), scale="free_y", dir="v", ncol=1) + 
+    xlab(bquote(nu)) + ylab("Density") + 
+    ggtitle(bquote("Mean batch size" ~ nu)) + 
+    theme_light() + theme(legend.position = "none", 
+                          plot.title = element_text(face="bold", hjust=0.5),
+                          strip.text = element_text(color="black", size=10))
+  
+  marginal_plot_grid <- plot_grid(plotlist=marginal_plots, nrow=1, align="vh", axis="tblr")
+  
+  title <- ggdraw() + draw_label(
+    bquote("mean" ~ lambda ~ "=" ~ .(MCMC_truth_vals[param_set[1],"LAMBDA"]*365) ~ "per year; " ~
+             eta ~ "=" ~ "1/" * .(1/MCMC_truth_vals[param_set[1], "ETA"]) ~ "per day; " ~
+             nu ~ "=" ~ .(MCMC_truth_vals[param_set[1], "NU"])),
+    fontface = 'bold', hjust = 0.5, size=16) +
+    theme(plot.margin = margin(0, 0, 0, 7))
+  
+  return(plot_grid(title, marginal_plot_grid, ncol=1, align="vh", axis="tblr", 
+                   rel_heights=c(0.1, 1)))
+}
+
+summarised_results <- lapply(param_groups, marginal_posterior_plots)
+
+lambda_groups <- 
+  split(1:length(param_groups), 
+        f=sapply(names(param_groups), function(x) strsplit(x, "\\.")[[1]][4]))
+
+lapply(lambda_groups, function(params) {
+  show(cowplot::plot_grid(plotlist=summarised_results[params], ncol=1,
+                          align="vh", axis="tblr"))})
+
+pdf("Simulation_studies/Pop_heterogeneity/pop_het_summary.pdf", 
+    width=14, height=22)
+  lapply(lambda_groups, function(params) {
+    show(cowplot::plot_grid(plotlist=summarised_results[params], ncol=1,
+                            align="vh", axis="tblr"))})
+invisible(dev.off())
+
+```
+
+Based on the incidence of symptomatic falciparum malaria (adjusted for treatment failure and left/right censoring), we estimate the degree of transmission heterogeneity in the SPf66 vaccine trial. We pool data across age groups, given there is appears to be no statistically meaningful age structure in the incidence of symptomatic falciparum malaria. 
+
+```{r pf_het}
+incidence_by_indiv <- read_rds("Spf66_data_processed/incidence_by_individual.rds")
+
+N_ITER_HET <- 8000
+LOG_KAPPA_PRIOR_MEAN=0.5
+LOG_KAPPA_PRIOR_SD=1
+LOG_KAPPA_PROP_SD=0.1
+
+proportion_bites_top_20 <- function(k) {
+  0.2+dgamma(qgamma(0.8, shape=k, scale=1/k), shape=k+1, scale=1/k)/k
+}
+
+negbin_lhood <- function(lambda, kappa) {
+  sum(mapply(function(N, t) dnbinom(N, size=kappa, mu=lambda*t, log=TRUE),
+             incidence_by_indiv$N_Pf, incidence_by_indiv$Followup_Pf))
+}
+
+set.seed("01052024")
+
+if (RUN_ALL | !file.exists("Simulation_studies/Pop_heterogeneity/SPf66_Pf_het_fits.rds")) {
+  
+  Pf_het_fit <- data.frame(matrix(ncol = 4, nrow = 0))
+  colnames(Pf_het_fit) <- c("CHAIN", "ITER", "LAMBDA", "LOG_KAPPA")
+
+  for (chain in 1:N_CHAINS) {
+    # initialise 
+    param_vals <- data.frame(matrix(ncol = 3, nrow = N_ITER_HET))
+    colnames(param_vals) <- c("LAMBDA", "LOG_KAPPA", "LOG_LIK")
+  
+    param_vals[1, "LAMBDA"] <-  runif(1, 0.2, 4)
+    param_vals[1, "LOG_KAPPA"] <- rnorm(1, LOG_KAPPA_PRIOR_MEAN, LOG_KAPPA_PRIOR_SD)
+    param_vals[1, "LOG_LIK"] <- negbin_lhood(param_vals[1, "LAMBDA"], exp(param_vals[1, "LOG_KAPPA"]))
+  
+    for (i in 2:N_ITER_HET) {
+      # sample parameter values from proposal distrbution
+      lambda_prop <- rnorm(1, param_vals[i-1, "LAMBDA"], LAMBDA_PROP_SD*365)
+      if (lambda_prop<0) lambda_prop <- param_vals[i-1, "LAMBDA"]
+    
+      kappa_prop <- rnorm(1, param_vals[i-1, "LOG_KAPPA"], LOG_KAPPA_PROP_SD)
+    
+      # calculate likelihood ratio
+      likelihood_prop <- negbin_lhood(lambda_prop, exp(kappa_prop))
+    
+      likelihood_ratio <- exp(likelihood_prop-param_vals[i-1, "LOG_LIK"])*
+        dnorm(kappa_prop, LOG_KAPPA_PRIOR_MEAN, LOG_KAPPA_PRIOR_SD)/
+        dnorm(param_vals[i-1, "LOG_KAPPA"], LOG_KAPPA_PRIOR_MEAN, LOG_KAPPA_PRIOR_SD)
+
+      # accept or reject
+      if (runif(1)<=likelihood_ratio) {
+        param_vals[i, "LAMBDA"] <- lambda_prop
+        param_vals[i, "LOG_KAPPA"] <- kappa_prop
+        param_vals[i, "LOG_LIK"] <- likelihood_prop
+      } else {
+        param_vals[i, ] <- param_vals[i-1,]
+      }
+    }
+    Pf_het_fit <- bind_rows(Pf_het_fit, bind_cols(ITER=1:N_ITER_HET, CHAIN=chain, param_vals))
+  }
+  
+  write_rds(Pf_het_fit, 
+            "Simulation_studies/Pop_heterogeneity/SPf66_Pf_het_fits.rds",
+            compress="gz")
+} else {
+  Pf_het_fit <- read_rds("Simulation_studies/Pop_heterogeneity/SPf66_Pf_het_fits.rds")
+}
+
+```
+
+```{r pf_het_plot, echo=FALSE, fig.width=14, fig.height=4}
+Pf_het_fit_GR <- calculate_Gelman_Rubin(Pf_het_fit, N_ITER_HET, N_ITER_HET*BURNIN_PROP, 
+                                        N_CHAINS, c("LAMBDA", "LOG_KAPPA"))
+
+Pf_het_posterior <- Pf_het_fit %>% subset(ITER>BURNIN_PROP*N_ITER_HET)
+
+Pf_het_marginal <- list()
+Pf_het_marginal[["lambda"]] <- ggplot(Pf_het_posterior) + 
+  geom_density(aes(x=LAMBDA, color=as.character(CHAIN))) + 
+  annotate("label", x=Inf, y=Inf, hjust=1, vjust=1,
+           label=paste0("Gelman-Rubin diagnostic R=", round(Pf_het_fit_GR[["LAMBDA"]], 3))) +
+  xlab("Incidence rate of symptomatic falciparum malaria\n(per person per year)") + 
+  ylab("Density") + ggtitle("Incidence rate of\nsymptomatic falciparum malaria") +
+  theme_bw() + theme(legend.position = "none",
+                     plot.title = element_text(hjust=0.5, face="bold"))
+
+Pf_het_marginal[["kappa"]] <- ggplot() + 
+  geom_density(data=Pf_het_posterior, aes(x=LOG_KAPPA, color=as.character(CHAIN))) + 
+  geom_density(data=data.frame(x=rnorm(50000, LOG_KAPPA_PRIOR_MEAN, LOG_KAPPA_PRIOR_SD)),
+               aes(x=x), alpha=0.2, fill="grey", col="black", lwd=0.4) +
+  annotate("label", x=Inf, y=Inf, hjust=1, vjust=1,
+           label=paste0("Gelman-Rubin diagnostic R=", round(Pf_het_fit_GR[["LOG_KAPPA"]], 3))) +
+  xlab("log(Gamma shape parameter)") + 
+  ylab("Density") + ggtitle("Heterogeneity shape parameter\n(Gamma)") +
+  theme_bw() + theme(legend.position = "none",
+                     plot.title = element_text(hjust=0.5, face="bold"))
+
+Pf_het_marginal[["prop_20"]] <- ggplot() + 
+  geom_density(data=Pf_het_posterior, aes(x=proportion_bites_top_20(exp(LOG_KAPPA))*100,
+                                          color=as.character(CHAIN))) + 
+  geom_density(data=data.frame(x=proportion_bites_top_20(exp(rnorm(50000, LOG_KAPPA_PRIOR_MEAN, LOG_KAPPA_PRIOR_SD)))),
+               aes(x=x*100), alpha=0.2, fill="grey", col="black", lwd=0.4) +
+  xlab("Percentage of symptomatic falciparum\nepisodes experienced by top 20% of hosts") + 
+  ylab("Density") + ggtitle("Percentage of symptomatic falciparum\nepisodes experienced by top 20% of hosts") +
+  theme_bw() + theme(legend.position = "none",
+                     plot.title = element_text(hjust=0.5, face="bold"))
+
+Pf_het_plot <- cowplot::plot_grid(plotlist=Pf_het_marginal, nrow = 1, align="vh", axis="tblr")
+
+show(Pf_het_plot)
+
+pdf("Simulation_studies/Pop_heterogeneity/SPf66_Pf_het_estimates.pdf", width=14, height=4)
+show(Pf_het_plot)
+invisible(dev.off())
+
+```
+
+## Misspecification of sporozoite batch size
+
+The assumption of geometrically-distributed batch sizes may be misspecified. We therefore perform a simulation study, whereby data are simulated under negative binomial sporozoite batch sizes (which may be under- or over-dispersed relative to the geometric distribution), but inference is performed under a misspecified framework predicated on geometric batch sizes.
+
+```{r batch_size}
+set.seed("11122023")
+
+batch_sensitivity <- list()
+
+for (k in 1:nrow(PARAM_TRUTH_BATCH)) {
+  if (RUN_ALL | !file.exists(paste0("Simulation_studies/Batch_size/batch_sensitivity_", k, ".rds"))) {
+    
+    # simulate recurrences using direct stochastic simulation
+    inf_matrix <- simulate_cohort(SEASONALITY*PARAM_TRUTH_BATCH[k, "LAMBDA_MEAN_TRUTH"],
+                                  TIME_STEP, N_AGES, N_OBS, 
+                                  PARAM_TRUTH_BATCH[k, "NU_TRUTH"], PARAM_TRUTH_BATCH[k, "R_TRUTH"],
+                                  PARAM_TRUTH_BATCH[k, "ETA_TRUTH"], PREL, U=1, SHIFT_AGE=1)
+    
+    # retain up to MAX_INF infections per individual
+    for (i in 1:nrow(inf_matrix)) {
+      y <- cumsum(inf_matrix[i,])
+      inf_matrix[i, y>MAX_INF] <- NA
+    }
+    
+    # generate a ternary infection matrix adjusted for post-exposure prophylaxis
+    ternary_matrix <- matrix("M", nrow=nrow(inf_matrix), ncol=ncol(inf_matrix))
+    ternary_matrix[inf_matrix==0] <- "N"
+    ternary_matrix[inf_matrix==1] <- "C"
+  
+    for (i in 1:nrow(inf_matrix)) {
+      inf_times <- which(inf_matrix[i,]==1)
+      masked_times <- which(is.na(inf_matrix[i,]))
+    
+      if (PROPHYLAXIS_WINDOW>0) {
+        for (j in 1:ncol(inf_matrix)) {
+          if (!is.na(inf_matrix[i, j]) & inf_matrix[i, j]==1) {
+            # period of complete prophylactic protection
+            inf_matrix[i,  subset(j+(1:PROPHYLAXIS_WINDOW), j+(1:PROPHYLAXIS_WINDOW)<=ncol(inf_matrix))] <- NA
+            ternary_matrix[i,  subset(j+(1:PROPHYLAXIS_WINDOW), j+(1:PROPHYLAXIS_WINDOW)<=ncol(inf_matrix))] <- "M"
+          
+            # prophylactic bunching period
+            check <- any(inf_matrix[i,  subset(j+PROPHYLAXIS_WINDOW+(1:BUNCHING_WINDOW), 
+                                             j+PROPHYLAXIS_WINDOW+(1:BUNCHING_WINDOW)<=ncol(inf_matrix))]==1)
+            check <- ifelse(is.na(check), FALSE, check)
+            if (check) {
+              inf_matrix[i,  subset(j+PROPHYLAXIS_WINDOW+BUNCHING_WINDOW, 
+                                    j+PROPHYLAXIS_WINDOW+BUNCHING_WINDOW<=ncol(inf_matrix))] <- 1
+              inf_matrix[i,  subset(j+PROPHYLAXIS_WINDOW+(1:(BUNCHING_WINDOW-1)), 
+                                    j+PROPHYLAXIS_WINDOW+(1:(BUNCHING_WINDOW-1))<=ncol(inf_matrix))] <- 0
+              ternary_matrix[i,  subset(j+PROPHYLAXIS_WINDOW+(1:BUNCHING_WINDOW), 
+                                        j+PROPHYLAXIS_WINDOW+(1:BUNCHING_WINDOW)<=ncol(inf_matrix))] <- "B"
+            }
+          }
+        }
+      }
+      ternary_matrix[i, masked_times] <- "M" 
+    }
+  
+    # generate S vectors
+    S_vectors <- generate_S_vectors(split(ternary_matrix, 1:nrow(ternary_matrix)))
+    
+    # https://stackoverflow.com/questions/8413188/can-i-nest-parallelparlapply
+    # parallelise over chains 
+    cl <- makeCluster(N_CHAINS)
+  
+    # export objects from local function environment
+    clusterExport(cl, c('S_vectors', 'N_AGES', 'PREL', 'N_OBS', 'TIME_STEP',
+                        'SEASONALITY', 'N_ITER', 'N_CORES_PER_CHAIN',
+                        'LAMBDA_PROP_SD', 'NU_PROP_SD', 'ETA_PROP_SD'),
+                  envir=environment())
+  
+    MCMC_results <- parLapply(cl, 1:length(cl), function(CHAIN) {
+    
+      source("Model_calibration_code/clin_inf_likelihood_helper_func.R")
+    
+      param_vals <- data.frame(matrix(ncol = 6, nrow = N_ITER))
+      colnames(param_vals) <- c("CHAIN", "ITER", "LAMBDA", "NU", "ETA", "LOG_LIK")
+      param_vals[, "CHAIN"] <- CHAIN
+      param_vals[, "ITER"] <- 1:N_ITER
+    
+      # initialise parameter values
+      param_vals[1, "LAMBDA"] <-  runif(1, 0.1/365, 1/365)
+      param_vals[1, "NU"] <-  runif(1, 0.5, 8)
+      param_vals[1, "ETA"] <- runif(1, 1/500, 1/50)
+      param_vals[1, "LOG_LIK"] <- 
+        cohort_likelihood(S_vectors[["S_plus"]], S_vectors[["S_minus"]], N_AGES, 
+                          1, SEASONALITY*param_vals[1, "LAMBDA"],
+                          param_vals[1, "ETA"], param_vals[1, "NU"], PREL, 
+                          N_OBS, TIME_STEP, 1, 1, N_CORES_PER_CHAIN)
+    
+      for (i in 2:N_ITER) {
+        # sample parameter values from proposal distrbution
+        lambda_prop <- rnorm(1, param_vals[i-1, "LAMBDA"], LAMBDA_PROP_SD)
+        if (lambda_prop<0) lambda_prop <- param_vals[i-1, "LAMBDA"]
+      
+        nu_prop <- rnorm(1, param_vals[i-1, "NU"], NU_PROP_SD)
+        if (nu_prop<0) nu_prop <- param_vals[i-1, "NU"]
+      
+        eta_prop <- rnorm(1, param_vals[i-1, "ETA"], ETA_PROP_SD)
+        if (eta_prop<0) eta_prop <- param_vals[i-1, "ETA"]
+      
+        # calculate likelihood ratio
+        likelihood_prop <- 
+          cohort_likelihood(S_vectors[["S_plus"]], S_vectors[["S_minus"]], N_AGES, 
+                            1, SEASONALITY*lambda_prop,
+                            eta_prop, nu_prop, PREL, N_OBS, TIME_STEP, 
+                            1, 1, N_CORES_PER_CHAIN)
+      
+        likelihood_ratio <- exp(likelihood_prop-param_vals[i-1, "LOG_LIK"])
+      
+        # accept or reject
+        if (runif(1)<=likelihood_ratio) {
+          param_vals[i, "LAMBDA"] <- lambda_prop
+          param_vals[i, "NU"] <- nu_prop
+          param_vals[i, "ETA"] <- eta_prop
+          param_vals[i, "LOG_LIK"] <- likelihood_prop
+        } else {
+          param_vals[i, 3:6] <- param_vals[i-1, 3:6]
+        }
+      }
+    
+      return(param_vals)
+    
+    })
+  
+    collated_results <- list(MCMC_results=bind_rows(MCMC_results),
+                            LAMBDA_TRUTH=PARAM_TRUTH_BATCH[k, "LAMBDA_MEAN_TRUTH"], 
+                            NU_TRUTH=PARAM_TRUTH_BATCH[k, "NU_TRUTH"],
+                            R_TRUTH=PARAM_TRUTH_BATCH[k, "R_TRUTH"], 
+                            ETA_TRUTH=PARAM_TRUTH_BATCH[k, "ETA_TRUTH"], 
+                            ternary_matrix=ternary_matrix)
+  
+    write_rds(collated_results, 
+              paste0("Simulation_studies/Batch_size/batch_sensitivity_", k, ".rds"),
+              compress = "gz")
+  } else {
+    collated_results <- read_rds(paste0("Simulation_studies/Batch_size/batch_sensitivity_", k, ".rds"))
+  }
+  
+  batch_sensitivity[[k]] <- collated_results
+}
+
+```
+
+```{r batch_size_plot, echo=FALSE, fig.width=16.5, fig.height=18}
+
+force_prim <- function(LAMBDA, NU, R) {
+  LAMBDA*(1-1/(1+NU/R*(1-PREL))^R)
+} 
+
+rel_prim <- function(NU, R) {
+  NU*PREL/(1-1/(1+NU/R*(1-PREL))^R)
+}
+
+rename_params <- data.frame(row.names=c("ETA", "LAMBDA", "NU", "FORCE_PRIM", "REL_PRIM"),
+                            new=c("η", "λ", "ν", "force of primary infection",
+                                  "ratio of relapse vs primary inf"))
+
+MCMC_results_reparam <- lapply(batch_sensitivity, function(sim_run) {
+  sim_run[["MCMC_results"]] %>%
+    subset(ITER>BURNIN_PROP*N_ITER) %>%
+    transmute(CHAIN=CHAIN, ITER=ITER, ETA=ETA, LAMBDA=LAMBDA, NU=NU,
+              FORCE_PRIM=force_prim(LAMBDA, NU, 1), REL_PRIM=rel_prim(NU, 1)) %>%
+    reshape2::melt(id=c("CHAIN", "ITER"))})
+
+param_cols <- c("ETA", "LAMBDA", "NU")
+
+Gelman_Rubin <- lapply(batch_sensitivity, function(sim_run) {
+  calculate_Gelman_Rubin(sim_run[["MCMC_results"]], N_ITER, N_ITER*BURNIN_PROP, 
+                         N_CHAINS, param_cols)
+})
+
+MCMC_truth_vals <- sapply(batch_sensitivity, function(sim_run) {
+  c(ETA=sim_run[["ETA_TRUTH"]], LAMBDA=sim_run[["LAMBDA_TRUTH"]], 
+    NU=sim_run[["NU_TRUTH"]], R=sim_run[["R_TRUTH"]],
+    FORCE_PRIM=force_prim(sim_run[["LAMBDA_TRUTH"]], sim_run[["NU_TRUTH"]],
+                          sim_run[["R_TRUTH"]]),
+    REL_PRIM=rel_prim(sim_run[["NU_TRUTH"]], sim_run[["R_TRUTH"]]))}) %>% 
+  t %>% as.data.frame %>% mutate(param=1:nrow(.)) %>%
+  mutate(r=paste0("r=", R, ifelse(R<1, " (overdispersed)",
+                                  ifelse(R>1, " (underdispersed)", " (geometric)"))))
+
+param_groups <- split(MCMC_truth_vals, f=~NU+ETA+LAMBDA) %>% lapply(function(x) x$param)
+
+marginal_posterior_plots <- function(param_set){
+  marginal_posteriors <- 
+    lapply(param_set, function(i) 
+      bind_cols(MCMC_results_reparam[[i]], 
+                r=paste0("r=", MCMC_truth_vals[i,"R"], 
+                         ifelse(MCMC_truth_vals[i,"R"]<1, " (overdispersed)",
+                                ifelse(MCMC_truth_vals[i,"R"]>1, " (underdispersed)", 
+                                       " (geometric)"))))) %>% 
+    bind_rows %>% split(f=.$variable)
+  
+  n_sporozoite <- lapply(param_set, function(i) {
+    data.frame(n=0:20, prob=dnbinom(0:20, size=batch_sensitivity[[i]][["R_TRUTH"]],
+                                    mu=batch_sensitivity[[i]][["NU_TRUTH"]]),
+               r=paste0("r=", MCMC_truth_vals[i,"R"], 
+                        ifelse(MCMC_truth_vals[i,"R"]<1, " (overdispersed)",
+                               ifelse(MCMC_truth_vals[i,"R"]>1, " (underdispersed)", 
+                                      " (geometric)"))))}) %>% bind_rows()
+
+  n_inf <- lapply(param_set, function(i) {
+    data.frame(n=rowSums(batch_sensitivity[[i]][["ternary_matrix"]]=="C") + 
+                        rowSums(batch_sensitivity[[i]][["ternary_matrix"]]=="B")/2,
+               r=paste0("r=", MCMC_truth_vals[i,"R"], 
+                        ifelse(MCMC_truth_vals[i,"R"]<1, " (overdispersed)",
+                               ifelse(MCMC_truth_vals[i,"R"]>1, " (underdispersed)", 
+                                      " (geometric)"))))}) %>% bind_rows()
+  
+  marginal_plots <- list()
+  
+  marginal_plots[["n_sporozoite"]] <- ggplot(n_sporozoite) + 
+    geom_bar(aes(x=n, y=prob), stat="identity") + 
+    facet_wrap(vars(r), dir="v", ncol=1) + 
+    scale_x_continuous(breaks=seq(0, 20, 2)) +
+    xlab("No. successful sporozoites") + ylab("Probability mass") + 
+    ggtitle("Sporozoite batch") +
+    theme_light() + theme(legend.position = "none",
+                          plot.subtitle = element_text(hjust=0.5),
+                          plot.title = element_text(hjust=0.5),
+                          strip.text = element_text(color="black", size=10))
+  
+  marginal_plots[["n_inf"]] <- ggplot(n_inf) + 
+    geom_bar(aes(x=n, fill=(n<=MAX_INF))) + 
+    facet_wrap(vars(r), scale="free_y", dir="v", ncol=1) + 
+    xlab("No. recurrences") + ylab("No. individuals") + 
+    ggtitle("Simulated recurrences") +
+    theme_light() + theme(legend.position = "none",
+                          plot.title = element_text(hjust=0.5),
+                          strip.text = element_text(color="black", size=10))
+  
+  marginal_plots[["ETA"]] <- ggplot() + 
+    geom_density(data=marginal_posteriors[["ETA"]], 
+                 aes(x=value, color=as.character(CHAIN))) + 
+    geom_vline(data=MCMC_truth_vals[param_set,], aes(xintercept=ETA)) + 
+    coord_cartesian(xlim=c(0, NA)) +
+    facet_wrap(vars(r), scale="free_y", dir="v", ncol=1) + 
+    xlab(bquote(eta ~ "(per day)")) + ylab("Density") + 
+    ggtitle(bquote("Activation rate" ~ eta)) + 
+    theme_light() + theme(legend.position = "none",
+                          plot.title = element_text(face="bold", hjust=0.5),
+                          strip.text = element_text(color="black", size=10))
+  
+  marginal_plots[["LAMBDA"]] <- ggplot() + 
+    geom_density(data=marginal_posteriors[["LAMBDA"]], 
+                 aes(x=value*365, color=as.character(CHAIN))) + 
+    geom_vline(data=MCMC_truth_vals[param_set,],aes(xintercept=LAMBDA*365)) + 
+    coord_cartesian(xlim=c(0, NA)) +
+    facet_wrap(vars(r), scale="free_y", dir="v", ncol=1) + 
+    xlab(bquote(lambda ~ "(per year)")) + ylab("Density") + 
+    ggtitle(bquote("Force of reinfection" ~ lambda)) + 
+    theme_light() + theme(legend.position = "none", 
+                          plot.title = element_text(face="bold", hjust=0.5),
+                          strip.text = element_text(color="black", size=10))
+  
+  marginal_plots[["NU"]] <- ggplot() + 
+    geom_density(data=marginal_posteriors[["NU"]],
+                 aes(x=value, color=as.character(CHAIN))) + 
+    geom_vline(data=MCMC_truth_vals[param_set,], aes(xintercept= NU)) + 
+    coord_cartesian(xlim=c(0, NA)) +
+    facet_wrap(vars(r), scale="free_y", dir="v", ncol=1) + 
+    xlab(bquote(nu)) + ylab("Density") + 
+    ggtitle(bquote("Mean batch size" ~ nu)) + 
+    theme_light() + theme(legend.position = "none", 
+                          plot.title = element_text(face="bold", hjust=0.5),
+                          strip.text = element_text(color="black", size=10))
+  
+  marginal_plots[["FORCE_PRIM"]] <- ggplot() + 
+    geom_density(data=marginal_posteriors[["FORCE_PRIM"]],
+                 aes(x=value*365, color=as.character(CHAIN))) + 
+    geom_vline(data=MCMC_truth_vals[param_set,], aes(xintercept=FORCE_PRIM*365)) + 
+    coord_cartesian(xlim=c(0, NA)) +
+    facet_wrap(vars(r), scale="free_y", dir="v", ncol=1) + 
+    xlab(bquote(lambda[prim] ~ "(per year)")) + ylab("Density") + 
+    ggtitle("Force of primary inf") + 
+    theme_light() + theme(legend.position = "none", 
+                          plot.title = element_text( hjust=0.5),
+                          strip.text = element_text(color="black", size=10))
+  
+  marginal_plots[["REL_PRIM"]] <- ggplot() + 
+    geom_density(data=marginal_posteriors[["REL_PRIM"]],
+                 aes(x=value, color=as.character(CHAIN))) + 
+    geom_vline(data=MCMC_truth_vals[param_set,], aes(xintercept=REL_PRIM)) + 
+    coord_cartesian(xlim=c(0, NA)) +
+    facet_wrap(vars(r), scale="free_y", dir="v", ncol=1) + 
+    xlab(expression(G[relapse:prim])) + ylab("Density") + 
+    ggtitle("Relapse:prim ratio") + 
+    theme_light() + theme(legend.position = "none", 
+                          plot.title = element_text(hjust=0.5),
+                          strip.text = element_text(color="black", size=10))
+  
+  marginal_plot_grid <- plot_grid(plotlist=marginal_plots, nrow=1, align="vh", axis="tblr")
+  
+  title <- ggdraw() + draw_label(
+    bquote(lambda ~ "=" ~ .(MCMC_truth_vals[param_set[1],"LAMBDA"]*365) ~ "per year; " ~
+             eta ~ "=" ~ "1/" * .(1/MCMC_truth_vals[param_set[1], "ETA"]) ~ "per day; " ~
+             nu ~ "=" ~ .(MCMC_truth_vals[param_set[1], "NU"])),
+    fontface = 'bold', hjust = 0.5, size=16) +
+    theme(plot.margin = margin(0, 0, 0, 7))
+  
+  return(plot_grid(title, marginal_plot_grid, ncol=1, align="vh", axis="tblr", 
+                   rel_heights=c(0.1, 1)))
+}
+
+summarised_results <- lapply(param_groups, marginal_posterior_plots)
+
+lambda_groups <- 
+  split(1:length(param_groups), 
+        f=sapply(names(param_groups), function(x) strsplit(x, "\\.")[[1]][1]))
+
+lapply(lambda_groups, function(params) {
+  show(cowplot::plot_grid(plotlist=summarised_results[params], ncol=1,
+                          align="vh", axis="tblr"))})
+
+pdf("Simulation_studies/Batch_size/batch_sensitivity_summary.pdf", 
+    width=16.5, height=18)
+  lapply(lambda_groups, function(params) {
+    show(cowplot::plot_grid(plotlist=summarised_results[params], ncol=1,
+                            align="vh", axis="tblr"))})
+invisible(dev.off())
+
+```
+
