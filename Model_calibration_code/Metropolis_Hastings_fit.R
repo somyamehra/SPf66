@@ -123,7 +123,7 @@ Metropolis_Hastings <- function(inf_states_by_VIN, N_AGES, PREL, N_OBS, TIME_STE
 
 calculate_Gelman_Rubin <- function(MCMC_results, N_ITER, BURNIN, N_CHAINS, PARAMS) {
   
-  MCMC_results <- MCMC_results %>% subset(ITER>=BURNIN)
+  MCMC_results <- MCMC_results %>% subset(ITER>BURNIN)
   
   within_chain_var <- MCMC_results %>% dplyr::select(c("CHAIN", PARAMS)) %>%
     group_by(CHAIN) %>% summarise_all(var) %>% dplyr::select(-CHAIN)
@@ -135,6 +135,6 @@ calculate_Gelman_Rubin <- function(MCMC_results, N_ITER, BURNIN, N_CHAINS, PARAM
   
   var_within_chain_mean <- matrixStats::colVars(as.matrix(within_chain_mean))
   
-  return(sqrt(1 - 1/N_ITER + (1+1/N_CHAINS)*var_within_chain_mean/mean_within_chain_var))
+  return(1 - 1/(N_ITER-BURNIN) + (1+1/N_CHAINS)*var_within_chain_mean/mean_within_chain_var)
   
 }

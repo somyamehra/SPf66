@@ -939,13 +939,13 @@ At a force of inoculation of 0.5 infectious bites per year, individuals who have
 
 ```{r recent_recur_hyp_predictor_plot, echo=FALSE, fig.height=5.5, fig.width=6, out.width="50%"}
 recent_recur_plot <- ggplot(sensitivity_specificity_recent_recur) + 
-  geom_line(aes(x=LAMBDA, y=value, color=variable, lty=variable), lwd=0.75) +
+  geom_line(aes(x=LAMBDA, y=value, color=variable, lty=variable), lwd=0.85) +
   annotate("text", x=0.4, y=0.675, label=param_label_2, size=3.6) +
-  scale_color_manual(values=c("#4f4f4f", "darkgreen", "#996262"), name="",
+  scale_color_manual(values=c("#4f4f4f", "#13b042", "#ba5304"), name="",
                      labels=c("Randomly-sampled individual",
                               "Conditional on bloodstream infection within 9 months",
                               "Conditional on no bloodstream infections within 9 months")) +
-  scale_linetype_manual(values=c(2, 1, 1), name="",
+  scale_linetype_manual(values=c(2, 6, 1), name="",
                         labels=c("Randomly-sampled individual",
                                  "Conditional on bloodstream infection within 9 months",
                                  "Conditional on no bloodstream infections within 9 months")) +
