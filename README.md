@@ -1,5 +1,5 @@
-This repository contains code and a mininum analysis dataset to accompany the manuscript **Modelling the within-host dynamics of *Plasmodium vivax*
-hypnozoite activation: an analysis of the SPf66 vaccine trial** by Mehra et al, 2024. This is available as a preprint on medRxiv: <https://www.medrxiv.org/content/10.1101/2024.01.03.24300707v1>.
+This repository contains code and a mininum analysis dataset to accompany the paper **Modeling the within-host dynamics of *Plasmodium vivax*
+hypnozoite activation: An analysis of the SPf66 vaccine trial** by Mehra et al (2024), published in Proceedings of the National Academy of Sciences: <https://doi.org/10.1073/pnas.2401024121>.
 
 The analysis can be reproduced by running the R Markdown files as follows:
 * *Spf66_data_processing.Rmd*: this generates summary metrics for the Spf66 trial; performs adjustments for post-treatment prophylaxis and treatment failure; and pre-processes data for model calibration.
